@@ -17,10 +17,10 @@ def test(M, N, block_M, block_N, dtype="float16", accum_dtype="float"):
             A_shared = T.alloc_shared((block_M, block_N), dtype)
             tx = T.get_thread_binding(0)
             T.copy(A[bx * block_M, by * block_N], A_shared)
-            with T.attr(T.iter_var(tx, T.Range(0, 128), "DataPar", ""), "warp_specialized", 1):
+            with T.attr(T.iter_var(tx, T.Range(0, 128), "ThreadIndex", "threadIdx.x"), "warp_specialized", 1):
                 for i, j in T.Parallel(block_M, block_N):
                     A_shared[i, j] = A_shared[i, j] + 1
-            with T.attr(T.iter_var(tx, T.Range(128, 256), "DataPar", ""), "warp_specialized", 1):
+            with T.attr(T.iter_var(tx, T.Range(128, 256), "ThreadIndex", "threadIdx.x"), "warp_specialized", 1):
                 for i, j in T.Parallel(block_M, block_N):
                     A_shared[i, j] = A_shared[i, j] + 2
             T.copy(A_shared, B[bx * block_M, by * block_N])
@@ -44,7 +44,6 @@ def test(M, N, block_M, block_N, dtype="float16", accum_dtype="float"):
 
 
 func = test(1024, 1024, 128, 128)
-print(func)
 rt_mod, params = tilelang.lower(func)
 
 profiler = Profiler(rt_mod, params, result_idx=[1])
