@@ -154,15 +154,14 @@ def tilelang_chunk_gated_delta_rule_chunk_o_fwd(
             W_shared = T.alloc_shared((block_S, DK), dtype=input_dtype)
             V_new_fragment = T.alloc_fragment((block_S, block_DV), dtype=accum_dtype)
             V_new_shared = T.alloc_shared((block_S, block_DV), dtype=output_dtype)
+            V_shared = T.alloc_shared((block_S, block_DV), dtype=output_dtype)
             K_shared = T.alloc_shared((block_S, DK), dtype=input_dtype)
             G_last_local = T.alloc_local((1), dtype=gate_dtype)
-            G_shared = T.alloc_shared((block_S, block_DV), dtype=gate_dtype)
-            # G_shared_1 = T.alloc_shared((block_S,), dtype=gate_dtype, scope="shared")
+            G_shared = T.alloc_shared((block_S, block_DV), dtype=gate_dtype, scope="shared")
             G_fragment = T.alloc_fragment((block_S, block_DV), dtype=gate_dtype)
             A_fragment = T.alloc_fragment((block_S, block_S), dtype=accum_dtype)
             O_fragment = T.alloc_fragment((block_S, block_DV), dtype=accum_dtype)
             G_diff_local = T.alloc_fragment((block_S, block_S), dtype=gate_dtype)
-            # G_diff_local = T.alloc_fragment((1), dtype=gate_dtype)
 
             # T.no_set_max_nreg()
 
@@ -172,14 +171,12 @@ def tilelang_chunk_gated_delta_rule_chunk_o_fwd(
                 W_shared: tilelang.layout.make_swizzled_layout(W_shared),
                 V_new_shared: tilelang.layout.make_swizzled_layout(V_new_shared),
                 K_shared: tilelang.layout.make_swizzled_layout(K_shared),
-                G_shared: tilelang.layout.make_swizzled_layout(G_shared),
+                # G_shared: tilelang.layout.make_swizzled_layout(G_shared),
                 A_shared: tilelang.layout.make_swizzled_layout(A_shared),
                 O_shared: tilelang.layout.make_swizzled_layout(O_shared),
                 # G_diff_local: T.Fragment(G_diff_local.shape, forward_thread_fn=lambda i: i // 16 * 32 + i % 8 * 4),
             })
 
-            T.clear(A_fragment)
-            T.clear(O_fragment)
             if use_initial_state:
                 T.copy(initial_state[bb, bh, 0:DK, bv * block_DV:(bv + 1) * block_DV], b_h_shared)
                 T.copy(b_h_shared, b_h_fragment)
@@ -206,8 +203,8 @@ def tilelang_chunk_gated_delta_rule_chunk_o_fwd(
 
                 # Save V_new
                 if save_new_value:
-                    # T.copy(V_new_fragment, dst=V_new_shared)
-                    T.copy(V_new_fragment, V_new[bb, i_s * block_S:(i_s + 1) * block_S, bh, bv * block_DV:(bv + 1) * block_DV])
+                    T.copy(V_new_fragment, V_shared)
+                    T.copy(V_shared, V_new[bb, i_s * block_S:(i_s + 1) * block_S, bh, bv * block_DV:(bv + 1) * block_DV])
 
                 T.copy(K[bb, i_s * block_S:(i_s + 1) * block_S, bh, 0:DK], K_shared)
                 # use_g
@@ -235,6 +232,8 @@ def tilelang_chunk_gated_delta_rule_chunk_o_fwd(
                 T.copy(V_new_fragment, V_new_shared)
                 T.gemm(K_shared, V_new_shared, b_h_fragment, transpose_A=True)
 
+                T.clear(A_fragment)
+                T.clear(O_fragment)
                 T.copy(Q[bb, i_s * block_S:(i_s + 1) * block_S, bh, 0:DK], Q_shared)
                 T.gemm(Q_shared, b_h_shared, O_fragment)
                 T.gemm(Q_shared, K_shared, A_fragment, transpose_B=True)
@@ -245,11 +244,11 @@ def tilelang_chunk_gated_delta_rule_chunk_o_fwd(
                     for p_s, p_v in T.Parallel(block_S, block_DV):
                         O_fragment[p_s, p_v] = O_fragment[p_s, p_v] * T.exp(G[bb, i_s * block_S + p_s, bh])
                     for p_s1, p_s2 in T.Parallel(block_S, block_S):
-                        G_diff_local[p_s1, p_s2] = 0
+                        G_diff_local[p_s1, p_s2] = G[bb, i_s * block_S + p_s1, bh] - G[bb, i_s * block_S + p_s2, bh]
                     for p_s1, p_s2 in T.Parallel(block_S, block_S):
                         with T.If(G_diff_local[p_s1, p_s2] <= 0):
                             with T.Then():
-                                A_fragment[p_s1, p_s2] = A_fragment[p_s1, p_s2] * T.exp(G_diff_local[p_s1, p_s2])
+                                A_fragment[p_s1, p_s2] *= T.exp(G_diff_local[p_s1, p_s2])
                             with T.Else():
                                 A_fragment[p_s1, p_s2] = 0
 
@@ -259,7 +258,7 @@ def tilelang_chunk_gated_delta_rule_chunk_o_fwd(
                             A_fragment[p_s1, p_s2] = 0
 
                 T.copy(A_fragment, A_shared)
-                T.gemm(A_shared, V_new_shared, O_fragment)
+                T.gemm(A_shared, V_shared, O_fragment)
 
                 for p_s, p_v in T.Parallel(block_S, block_DV):
                     O_fragment[p_s, p_v] = O_fragment[p_s, p_v] * scale
@@ -351,8 +350,8 @@ def run_test(
         B, S, H, DK, DV, input_dtype, output_dtype, accum_dtype, gate_dtype, state_dtype, chunk_size, use_g, use_initial_state, store_final_state, save_new_value, scale, block_DK, block_DV, threads, num_stages
     )
     kernel = tilelang.compile(program)
-    # # kernel = tilelang.compile(program, pass_configs={"tl.disable_warp_specialized" : True})
-    # # kernel = tilelang.compile(program, pass_configs={"tl.disable_tma_lower": True, "tl.disable_warp_specialized": True})
+    # kernel = tilelang.compile(program, pass_configs={"tl.disable_warp_specialized" : True})
+    # kernel = tilelang.compile(program, pass_configs={"tl.disable_tma_lower": True, "tl.disable_warp_specialized": True})
     print(kernel.get_kernel_source())
     kernel(Q, K, W, U, G, initial_state, h_tilelang, final_state_tilelang, V_new_tilelang, o_tilelang)
 
@@ -401,7 +400,7 @@ def run_test(
 if __name__ == "__main__":
     run_test(
         B=1,
-        S=64,
+        S=32768,
         H=32,
         DK=128,
         DV=128,
