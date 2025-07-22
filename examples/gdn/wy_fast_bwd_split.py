@@ -14,9 +14,11 @@ print(tilelang.__file__)
 import fla
 print(fla.__file__)
 
-from fla.ops.gated_delta_rule.wy_fast import prepare_wy_repr_bwd
+# from fla.ops.gated_delta_rule.wy_fast import prepare_wy_repr_bwd
+from triton_wy_bwd import bwd_prepare_wy_repr
 
 import torch
+from utils import assert_similar
 
 torch.random.manual_seed(0)
 torch.set_printoptions(profile="full")
@@ -210,21 +212,22 @@ def tilelang_wy_fast_bwd(
                     K_shared_beta_g[i_s, i_k2] = K_shared[i_s, i_k2] * Beta_shared[i_s] * G_shared_exp[i_s]
                 T.copy(dw[bb, bs * block_S:(bs + 1) * block_S, bh, i_k * block_DK:(i_k + 1) * block_DK], dw_shared)
                 T.gemm(dw_shared, K_shared_beta_g, dA_fragment, transpose_B=True)
-                T.gemm(A_shared, dw_shared, dk_fragment_beta_g, clear_accum=True)
+                T.gemm(A_shared, dw_shared, dk_fragment_beta_g, clear_accum=True, transpose_A=True)
                 for i_s, i_k2 in T.Parallel(block_S, block_DK):
                     dk_fragment[i_s, i_k2] = dk_fragment_beta_g[i_s, i_k2] * Beta_shared[i_s] * G_shared_exp[i_s]
                 # for i_s, i_k2 in T.Parallel(block_S, block_DK):
                 #     dbeta_fragment[i_s] = dbeta_fragment[i_s] + dk_fragment_beta_g[i_s, i_k2] * K_shared[i_s, i_k2] * G_shared_exp[i_s]
                 for i_s, i_k2 in T.Parallel(block_S, block_DK):
                     dbeta_fragment_reduce_tmpk[i_s, i_k2] = dk_fragment_beta_g[i_s, i_k2] * K_shared[i_s, i_k2] * G_shared_exp[i_s]
-                T.reduce_sum(dbeta_fragment_reduce_tmpk, dbeta_fragment_k, dim=1)
+                T.reduce_sum(dbeta_fragment_reduce_tmpk, dbeta_fragment_k, dim=1, clear=False)
 
                 # for i_s, i_k2 in T.Parallel(block_S, block_DK):
                 #     dg_fragment[i_s] = dg_fragment[i_s] + dk_fragment_beta_g[i_s, i_k2] * K_shared[i_s, i_k2] * G_shared_exp[i_s] * Beta_shared[i_s]
                 for i_s, i_k2 in T.Parallel(block_S, block_DK):
                     dg_fragment_reduce_tmp[i_s, i_k2] = dk_fragment_beta_g[i_s, i_k2] * K_shared[i_s, i_k2] * G_shared_exp[i_s] * Beta_shared[i_s]
-                T.reduce_sum(dg_fragment_reduce_tmp, dg_fragment, dim=1)
+                T.reduce_sum(dg_fragment_reduce_tmp, dg_fragment, dim=1, clear=False)
                 
+                # correct dk
                 T.copy(dk_fragment, dk[bb, bs * block_S:(bs + 1) * block_S, bh, i_k * block_DK:(i_k + 1) * block_DK])
 
             # Update dv
@@ -241,7 +244,7 @@ def tilelang_wy_fast_bwd(
                 #     dbeta_fragment[i_s] = dbeta_fragment[i_s] + dv_fragment_beta[i_s, i_v2] * V_shared[i_s, i_v2]
                 for i_s, i_v2 in T.Parallel(block_S, block_DV):
                     dbeta_fragment_reduce_tmpv[i_s, i_v2] = dv_fragment_beta[i_s, i_v2] * V_shared[i_s, i_v2]
-                T.reduce_sum(dbeta_fragment_reduce_tmpv, dbeta_fragment_v, dim=1)
+                T.reduce_sum(dbeta_fragment_reduce_tmpv, dbeta_fragment_v, dim=1, clear=False)
                 
                 T.copy(dv_fragment, dv[bb, bs * block_S:(bs + 1) * block_S, bh, i_v * block_DV:(i_v + 1) * block_DV])
 
@@ -249,6 +252,7 @@ def tilelang_wy_fast_bwd(
             for i_s in T.Parallel(block_S):
                 dbeta[bb, bs * block_S + i_s, bh] = dbeta_fragment_k[i_s] + dbeta_fragment_v[i_s]
                 dg[bb, bs * block_S + i_s, bh] = dg_fragment[i_s]
+            # correct dA
             T.copy(dA_fragment, dA[bb, bs * block_S:(bs + 1) * block_S, bh, :])
 
     return kernel
@@ -352,6 +356,7 @@ def tilelang_wy_fast_bwd_split(
                 # dbeta_fragment[i_s] = dbeta[bb, bs * block_S + i_s, bh]
                 # dg_fragment[i_s] = dg[bb, bs * block_S + i_s, bh]
             T.copy(dA[bb, bs * block_S:(bs + 1) * block_S, bh, :], dA_shared)
+            # T.copy(dA_shared, dA[bb, bs * block_S:(bs + 1) * block_S, bh, :])
 
             # Update dA
             T.copy(dA_shared, dA_fragment)
@@ -361,9 +366,9 @@ def tilelang_wy_fast_bwd_split(
                     with T.Then():
                         dA_fragment[i_s1, i_s2] = 0
             T.copy(dA_fragment, dA_shared)
-            T.gemm(dA_shared, A_shared, dA_fragment, clear_accum=True)
+            T.gemm(dA_shared, A_shared, dA_fragment, clear_accum=True, transpose_B=True)
             T.copy(dA_fragment, dA_shared)
-            T.gemm(A_shared, dA_shared, dA_fragment, clear_accum=True)
+            T.gemm(A_shared, dA_shared, dA_fragment, clear_accum=True, transpose_A=True)
             for i_s1, i_s2 in T.Parallel(block_S, block_S):
                 with T.If(i_s1 <= i_s2):
                     with T.Then():
@@ -372,12 +377,15 @@ def tilelang_wy_fast_bwd_split(
                         dA_fragment[i_s1, i_s2] = -dA_fragment[i_s1, i_s2]
             
             for i_s1, i_s2 in T.Parallel(block_S, block_S):
-                with T.If(G_shared[i_s1] - G_shared[i_s2] <= 0):
+                with T.If(G[bb, bs * block_S + i_s1, bh] - G[bb, bs * block_S + i_s2, bh] <= 0):
                     with T.Then():
-                        dA_fragment[i_s1, i_s2] = dA_fragment[i_s1, i_s2] * T.exp(G_shared[i_s1] - G_shared[i_s2])
+                        dA_fragment[i_s1, i_s2] *= T.exp(G[bb, bs * block_S + i_s1, bh] - G[bb, bs * block_S + i_s2, bh])
                     with T.Else():
                         dA_fragment[i_s1, i_s2] = 0
             T.copy(dA_fragment, dA_shared)
+
+            # acceptable dA diff
+            # T.copy(dA_fragment, dA[bb, bs * block_S:(bs + 1) * block_S, bh, :])
 
             # Update dk using previous dk
             T.clear(A_fragment)
@@ -393,7 +401,7 @@ def tilelang_wy_fast_bwd_split(
                 #     dbeta_fragment[i_s] = dbeta_fragment[i_s] + dk_fragment_beta[i_s, i_k2] * K_shared[i_s, i_k2]
                 for i_s, i_k2 in T.Parallel(block_S, block_DK):
                     dbeta_fragment_reduce_tmpk[i_s, i_k2] = dk_fragment_beta[i_s, i_k2] * K_shared[i_s, i_k2]
-                T.reduce_sum(dbeta_fragment_reduce_tmpk, dbeta_fragment_k, dim=1)
+                T.reduce_sum(dbeta_fragment_reduce_tmpk, dbeta_fragment_k, dim=1, clear=False)
                 T.gemm(dA_shared, K_shared_beta, dk_fragment, transpose_A=True)
                 for i_s, i_k2 in T.Parallel(block_S, block_DK):
                     dk_shared_beta[i_s, i_k2] = dk_fragment_beta[i_s, i_k2] * Beta_shared[i_s]
@@ -437,7 +445,7 @@ def run_test(
     threads=128,
     num_stages=0,
 ):
-    K, V, Beta, G, A, dw, du = prepare_input_fake(B, S, H, DK, DV, chunk_size, getattr(torch, input_dtype), getattr(torch, output_dtype), getattr(torch, accum_dtype), getattr(torch, gate_dtype), getattr(torch, state_dtype))
+    K, V, Beta, G, A, dw, du = prepare_input(B, S, H, DK, DV, chunk_size, getattr(torch, input_dtype), getattr(torch, output_dtype), getattr(torch, accum_dtype), getattr(torch, gate_dtype), getattr(torch, state_dtype))
     dk_ref, dv_ref, dbeta_ref, dg_ref = prepare_output(B, S, H, DK, DV, chunk_size, getattr(torch, output_dtype), getattr(torch, gate_dtype), getattr(torch, state_dtype))
     dk_tilelang, dv_tilelang, dbeta_tilelang, dg_tilelang = prepare_output(B, S, H, DK, DV, chunk_size, getattr(torch, output_dtype), getattr(torch, gate_dtype), getattr(torch, state_dtype))
     BS = chunk_size
@@ -447,7 +455,7 @@ def run_test(
     dg_tilelang_A_negative = torch.empty(B, S, H, BS, dtype=getattr(torch, gate_dtype)).cuda()
 
     # ref
-    dk_ref, dv_ref, dbeta_ref, dg_ref = prepare_wy_repr_bwd(K, V, G, Beta, A, dw, du, cu_seqlens=None)
+    dk_ref, dv_ref, dbeta_ref, dg_ref = bwd_prepare_wy_repr(K, V, G, Beta, A, dw, du, cu_seqlens=None)
     
     # tilelang
     program = tilelang_wy_fast_bwd(B, S, H, DK, DV, input_dtype, output_dtype, accum_dtype, gate_dtype, state_dtype, chunk_size, block_DK, block_DV, threads, num_stages)
@@ -462,53 +470,21 @@ def run_test(
     torch.cuda.synchronize()
     kernel_split(K, V, Beta, G, A, dw, du, dA_tilelang, dk_tilelang, dv_tilelang, dbeta_tilelang_k, dg_tilelang_A_positive, dg_tilelang_A_negative)
     dbeta_tilelang = dbeta_tilelang_k + dbeta_tilelang
+    # dbeta_tilelang = dbeta_tilelang_k
     dg_tilelang = dg_tilelang + dg_tilelang_A_positive.sum(dim=-1) - dg_tilelang_A_negative.sum(dim=-1)
     
-    # check
-    try:
-        torch.testing.assert_close(dk_ref, dk_tilelang, rtol=6e-3, atol=6e-3, equal_nan=True)
-        print("tilelang wy fast bwd dk passed √")
-    except Exception as e:
-        print("tilelang wy fast bwd dk failed ✗")
-        print(e)
-        print("dk ref:", dk_ref)
-        print("dk tilelang:", dk_tilelang)
-    
-    try:
-        torch.testing.assert_close(dv_ref, dv_tilelang, rtol=6e-3, atol=6e-3, equal_nan=True)
-        print("tilelang wy fast bwd dv passed √")
-    except Exception as e:
-        print("tilelang wy fast bwd dv failed ✗")
-        print(e)
-        print("dv ref:", dv_ref)
-        print("dv tilelang:", dv_tilelang)
-    
-    try:
-        torch.testing.assert_close(dbeta_ref, dbeta_tilelang, rtol=6e-3, atol=6e-3, equal_nan=True)
-        print("tilelang wy fast bwd dbeta passed √")
-    except Exception as e:
-        print("tilelang wy fast bwd dbeta failed ✗")
-        print(e)
-        print("dbeta ref:", dbeta_ref)
-        print("dbeta tilelang:", dbeta_tilelang)
-    
-    try:
-        torch.testing.assert_close(dg_ref, dg_tilelang, rtol=6e-3, atol=6e-3, equal_nan=True)
-        print("tilelang wy fast bwd dg passed √")
-    except Exception as e:
-        print("tilelang wy fast bwd dg failed ✗")
-        print(e)
-        print("dg ref:", dg_ref)
-        print("dg tilelang:", dg_tilelang)
-    
+    assert_similar(dk_ref, dk_tilelang, name="dk", raise_assert=False)
+    assert_similar(dv_ref, dv_tilelang, name="dv", raise_assert=False)
+    assert_similar(dbeta_ref, dbeta_tilelang, name="dbeta", raise_assert=False)
+    assert_similar(dg_ref, dg_tilelang, name="dg", raise_assert=False)
 
 if __name__ == "__main__":
-    DK = 32
-    DV = 32
+    DK = 128
+    DV = 128
     run_test(
         B=1,
-        S=64,
-        H=1,
+        S=32768,
+        H=4,
         DK=DK,
         DV=DV,
         input_dtype="bfloat16",
