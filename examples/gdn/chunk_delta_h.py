@@ -24,11 +24,11 @@ from tilelang.engine.callback import register_cuda_postproc_callback
 # (zhengju) Now we slightly modify the generated cuda code from tilelang lower in
 # the debug folder to make the performance better. To disable this callback,
 # you can just comment out the following function.
-@register_cuda_postproc_callback
-def tilelang_callback_cuda_postproc(code, _):
-    cuda_code = open("../debug/chunk_delta_h_fuse.cu", "r").read()
-    code = cuda_code
-    return code
+# @register_cuda_postproc_callback
+# def tilelang_callback_cuda_postproc(code, _):
+#     cuda_code = open("../debug/chunk_delta_h_fuse.cu", "r").read()
+#     code = cuda_code
+#     return code
 
 torch.random.manual_seed(0)
 
@@ -353,7 +353,7 @@ if __name__ == "__main__":
     run_test(
         B=1,
         S=32768,
-        H=32,
+        H=8,
         DK=128,
         DV=128,
         input_dtype="bfloat16",

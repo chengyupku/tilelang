@@ -1,5 +1,34 @@
 import torch
 
+def do_bench(fn, *args, warmup=10, rep=10, **kwargs):
+    """
+    Do benchmark for a function.
+    """
+    import time
+    start_event = [torch.cuda.Event(enable_timing=True) for i in range(rep)]
+    end_event = [torch.cuda.Event(enable_timing=True) for i in range(rep)]
+    for i in range(warmup):
+        fn(*args, **kwargs)
+
+
+    start_time = time.time()
+    torch.cuda.synchronize()
+    for i in range(rep):
+        start_event[i].record()
+        fn(*args, **kwargs)
+        end_event[i].record()
+    torch.cuda.synchronize()
+    end_time = time.time()
+
+    # Record clocks
+    times = torch.tensor(
+        [s.elapsed_time(e) for s, e in zip(start_event, end_event)],
+        dtype=torch.float,
+    )
+
+    # return (end_time - start_time) * 1000 / rep
+    return times.mean().item()
+    
 def print_red_warning(message):
     print(f"\033[31mWARNING: {message}\033[0m")
 
