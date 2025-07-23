@@ -427,6 +427,34 @@ def tilelang_wy_fast_bwd_split(
             
     return kernel
 
+def do_bench(fn, *args, warmup=10, rep=10, **kwargs):
+    """
+    Do benchmark for a function.
+    """
+    import time
+    start_event = [torch.cuda.Event(enable_timing=True) for i in range(rep)]
+    end_event = [torch.cuda.Event(enable_timing=True) for i in range(rep)]
+    for i in range(warmup):
+        fn(*args, **kwargs)
+
+
+    start_time = time.time()
+    torch.cuda.synchronize()
+    for i in range(rep):
+        start_event[i].record()
+        fn(*args, **kwargs)
+        end_event[i].record()
+    torch.cuda.synchronize()
+    end_time = time.time()
+
+    # Record clocks
+    times = torch.tensor(
+        [s.elapsed_time(e) for s, e in zip(start_event, end_event)],
+        dtype=torch.float,
+    )
+
+    # return (end_time - start_time) * 1000 / rep
+    return times.mean().item()
 
 def run_test(
     B,
@@ -477,6 +505,12 @@ def run_test(
     assert_similar(dv_ref, dv_tilelang, name="dv", raise_assert=False)
     assert_similar(dbeta_ref, dbeta_tilelang, name="dbeta", raise_assert=False)
     assert_similar(dg_ref, dg_tilelang, name="dg", raise_assert=False)
+
+    fla_time = do_bench(bwd_prepare_wy_repr, K, V, G, Beta, A, dw, du, None)
+    tilelang_time = do_bench(kernel_split, K, V, Beta, G, A, dw, du, dA_tilelang, dk_tilelang, dv_tilelang, dbeta_tilelang_k, dg_tilelang_A_positive, dg_tilelang_A_negative)
+
+    print(f"tilelang time: {tilelang_time} ms")
+    print(f"fla time: {fla_time} ms")
 
 if __name__ == "__main__":
     DK = 128
