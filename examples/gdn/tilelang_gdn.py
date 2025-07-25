@@ -20,6 +20,7 @@ import tilelang.language as T
 from chunk_scaled_dot_kkt import tilelang_chunk_scaled_dot_kkt_fwd
 from chunk_delta_h import tilelang_chunk_gated_delta_rule_fwd_h
 from chunk_o import tilelang_chunk_fwd_o
+from chunk_delta_bwd import tilelang_chunk_gated_delta_rule_bwd_dhu
 
 tilelang.disable_cache()
 
@@ -78,6 +79,90 @@ def tilelang_chunk_gated_delta_rule_fwd(
         g,
     )
     return g, o, A, final_state
+
+def tilelang_chunk_gated_delta_rule_bwd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    A: torch.Tensor,
+    scale: float,
+    initial_state: torch.Tensor,
+    do: torch.Tensor,
+    dht: torch.Tensor,
+    cu_seqlens: Optional[torch.LongTensor] = None,
+):
+    B, S, H, DK = k.shape
+    DV = v.shape[-1]
+    input_dtype="bfloat16"
+    output_dtype="bfloat16"
+    accum_dtype="float32"
+    gate_dtype="float32"
+    state_dtype="float32"
+    chunk_size=64
+    
+    w, u = recompute_w_u_fwd(
+        k=k,
+        v=v,
+        beta=beta,
+        A=A,
+        g_cumsum=g,
+        cu_seqlens=cu_seqlens,
+    )
+    h, _, v_new = tilelang_chunk_gated_delta_rule_fwd_h(B, S, H, DK, DV, input_dtype, output_dtype, accum_dtype, gate_dtype, state_dtype, chunk_size, use_g=True, use_initial_state=True, store_final_state=True, save_new_value=True, block_DK=64, block_DV=32, threads=128, num_stages=1)(
+        k,
+        w,
+        u,
+        g,
+        initial_state,
+    )
+    dv = chunk_bwd_dv_local(
+        q=q,
+        k=k,
+        g=g,
+        do=do,
+        scale=scale,
+        cu_seqlens=cu_seqlens,
+    )
+    dh, dh0, dv = tilelang_chunk_gated_delta_rule_bwd_dhu(B, S, H, DK, DV, input_dtype, output_dtype, accum_dtype, gate_dtype, state_dtype, chunk_size, scale, use_g=True, use_initial_state=True, use_final_state_gradient=True, block_DV=32, threads=128, num_stages=1)(
+        q,
+        k,
+        w,
+        g,
+        initial_state,
+        dht,
+        do,
+        dv,
+    )
+    dq, dk, dw, dg = chunk_bwd_dqkwg(
+        q=q,
+        k=k,
+        v=v_new,
+        w=w,
+        g=g,
+        h=h,
+        dv=dv,
+        do=do,
+        dh=dh,
+        scale=scale,
+        cu_seqlens=cu_seqlens,
+    )
+    dk2, dv, db, dg2 = prepare_wy_repr_bwd(
+        k=k,
+        v=v,
+        beta=beta,
+        g=g,
+        A=A,
+        dw=dw,
+        du=dv,
+        cu_seqlens=cu_seqlens,
+    )
+    dk.add_(dk2)
+    dg.add_(dg2)
+    assert dg.dtype == torch.float32, "dg should be fp32"
+    dg = chunk_local_cumsum(dg, chunk_size=64, reverse=True, cu_seqlens=cu_seqlens)
+    return dq, dk, dv, db, dg, dh0
     
 class TilelangChunkGatedDeltaRuleFunction(torch.autograd.Function):
 
@@ -128,28 +213,28 @@ class TilelangChunkGatedDeltaRuleFunction(torch.autograd.Function):
         do: torch.Tensor,
         dht: torch.Tensor
     ):
-        # q, k, v, g, beta, A, initial_state, cu_seqlens = ctx.saved_tensors
-        # if ctx.use_qk_l2norm_in_kernel:
-        #     q, q_orig = l2norm_fwd(q), q
-        #     k, k_orig = l2norm_fwd(k), k
-        # dq, dk, dv, db, dg, dh0 = chunk_gated_delta_rule_bwd(
-        #     q=q,
-        #     k=k,
-        #     v=v,
-        #     g=g,
-        #     beta=beta,
-        #     A=A,
-        #     scale=ctx.scale,
-        #     initial_state=initial_state,
-        #     do=do,
-        #     dht=dht,
-        #     cu_seqlens=cu_seqlens,
-        # )
-        # if ctx.use_qk_l2norm_in_kernel:
-        #     dq = l2norm_bwd(q_orig, dq)
-        #     dk = l2norm_bwd(k_orig, dk)
-        # return dq.to(q), dk.to(k), dv.to(v), dg.to(g), db.to(beta), None, dh0, None, None, None
-        return None, None, None, None, None, None, None, None, None, None
+        q, k, v, g, beta, A, initial_state, cu_seqlens = ctx.saved_tensors
+        if ctx.use_qk_l2norm_in_kernel:
+            q, q_orig = l2norm_fwd(q), q
+            k, k_orig = l2norm_fwd(k), k
+        dq, dk, dv, db, dg, dh0 = tilelang_chunk_gated_delta_rule_bwd(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            A=A,
+            scale=ctx.scale,
+            initial_state=initial_state,
+            do=do,
+            dht=dht,
+            cu_seqlens=cu_seqlens,
+        )
+        if ctx.use_qk_l2norm_in_kernel:
+            dq = l2norm_bwd(q_orig, dq)
+            dk = l2norm_bwd(k_orig, dk)
+        return dq.to(q), dk.to(k), dv.to(v), dg.to(g), db.to(beta), None, dh0, None, None, None
+        # return None, None, None, None, None, None, None, None, None, None
 
 
 
