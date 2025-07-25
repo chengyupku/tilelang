@@ -51,7 +51,7 @@ def prepare_input(
     DV,
     chunk_size,
     input_dtype,
-    output_dtype,
+    state_dtype,
     accum_dtype,
     gate_dtype,
 ):
@@ -67,7 +67,7 @@ def prepare_input(
     # W = torch.randn(B, S, H, DK, dtype=input_dtype).cuda() / (DK) ** 0.5
     # U = torch.randn(B, S, H, DV, dtype=input_dtype).cuda() / (DV) ** 0.5
     # G = torch.randn(B, S, H, dtype=gate_dtype).cuda()
-    initial_state = torch.randn(B, H, DK, DV, dtype=input_dtype).cuda()
+    initial_state = torch.randn(B, H, DK, DV, dtype=state_dtype).cuda()
     return K, W, U, G, initial_state
 
 
@@ -88,6 +88,7 @@ def prepare_output(
     return h, final_state, V_new
 
 
+@tilelang.jit(out_idx=[5, 6, 7])
 def tilelang_chunk_gated_delta_rule_fwd_h(
     # task config
     B,
@@ -130,7 +131,7 @@ def tilelang_chunk_gated_delta_rule_fwd_h(
         W: T.Tensor(W_shape, dtype=input_dtype),
         U: T.Tensor(U_shape, dtype=input_dtype),
         G: T.Tensor(G_shape, dtype=gate_dtype),
-        initial_state: T.Tensor(initial_state_shape, dtype=input_dtype),
+        initial_state: T.Tensor(initial_state_shape, dtype=state_dtype),
         h: T.Tensor(h_shape, dtype=output_dtype),
         final_state: T.Tensor(final_state_shape, dtype=state_dtype),
         V_new: T.Tensor(V_shape, dtype=output_dtype),
@@ -167,10 +168,11 @@ def tilelang_chunk_gated_delta_rule_fwd_h(
             T.use_swizzle(10)
 
             if use_initial_state:
-                T.copy(initial_state[bb, bh, 0:DK, bv * block_DV:(bv + 1) * block_DV], b_h_shared)
-                T.copy(b_h_shared, b_h_fragment)
+                T.copy(initial_state[bb, bh, 0:DK, bv * block_DV:(bv + 1) * block_DV], b_h_fragment)
             else:
                 T.clear(b_h_fragment)
+
+            T.copy(b_h_fragment, b_h_shared)
             
             for i_s in T.Pipelined(T.ceildiv(S, block_S), num_stages=num_stages):
                 # Store previous result to the hidden tensor, like the epilogue
@@ -283,7 +285,7 @@ def run_test(
     num_stages=0,
 ):
     K, W, U, G, initial_state = prepare_input(
-        B, S, H, DK, DV, chunk_size, getattr(torch, input_dtype), getattr(torch, output_dtype), getattr(torch, accum_dtype), getattr(torch, gate_dtype)
+        B, S, H, DK, DV, chunk_size, getattr(torch, input_dtype), getattr(torch, state_dtype), getattr(torch, accum_dtype), getattr(torch, gate_dtype)
     )
     h_ref, final_state_ref, V_new_ref = prepare_output(
         B, S, H, DK, DV, chunk_size, getattr(torch, output_dtype), getattr(torch, state_dtype)
@@ -297,19 +299,30 @@ def run_test(
         K, W, U, G, initial_state, store_final_state, chunk_size, save_new_value
     )
 
-    # tilelang
-    program = tilelang_chunk_gated_delta_rule_fwd_h(
-        B, S, H, DK, DV, input_dtype, output_dtype, accum_dtype, gate_dtype, state_dtype, chunk_size, use_g, use_initial_state, store_final_state, save_new_value, block_DK, block_DV, threads, num_stages
+    # # tilelang
+    # program = tilelang_chunk_gated_delta_rule_fwd_h(
+    #     B, S, H, DK, DV, input_dtype, output_dtype, accum_dtype, gate_dtype, state_dtype, chunk_size, use_g, use_initial_state, store_final_state, save_new_value, block_DK, block_DV, threads, num_stages
+    # )
+    # kernel = tilelang.compile(program)
+    # # kernel = tilelang.compile(program, pass_configs={"tl.disable_warp_specialized" : True})
+    # # kernel = tilelang.compile(program, pass_configs={"tl.disable_tma_lower": True, "tl.disable_warp_specialized": True})
+    # kernel(K, W, U, G, initial_state, h_tilelang, final_state_tilelang, V_new_tilelang)
+    # # (zhengju) If you want to print the generated cuda code, you can uncomment the following line
+    # # print("CUDA Code:\n", kernel.get_kernel_source())
+
+
+    jit_kernel = tilelang_chunk_gated_delta_rule_fwd_h(B, S, H, DK, DV, input_dtype, output_dtype, accum_dtype, gate_dtype, state_dtype, chunk_size, use_g, use_initial_state, store_final_state, save_new_value, block_DK, block_DV, threads, num_stages)
+    h_tilelang, final_state_tilelang, v_new_tilelang = jit_kernel(
+        K,
+        W,
+        U,
+        G,
+        initial_state,
     )
-    kernel = tilelang.compile(program)
-    # kernel = tilelang.compile(program, pass_configs={"tl.disable_warp_specialized" : True})
-    # kernel = tilelang.compile(program, pass_configs={"tl.disable_tma_lower": True, "tl.disable_warp_specialized": True})
-    kernel(K, W, U, G, initial_state, h_tilelang, final_state_tilelang, V_new_tilelang)
-    # (zhengju) If you want to print the generated cuda code, you can uncomment the following line
-    # print("CUDA Code:\n", kernel.get_kernel_source())
+
 
     fla_time = do_bench(chunk_gated_delta_rule_fwd_h, K, W, U, G, initial_state, store_final_state, chunk_size, save_new_value)
-    tilelang_time = do_bench(kernel, K, W, U, G, initial_state, h_tilelang, final_state_tilelang, V_new_tilelang)
+    tilelang_time = do_bench(jit_kernel, K, W, U, G, initial_state)
 
     # check correctness
     try:

@@ -53,6 +53,7 @@ def prepare_output(
     return O
 
 
+@tilelang.jit(out_idx=[-1])
 def tilelang_chunk_fwd_o(
     # task config
     B,
@@ -186,10 +187,8 @@ def run_test(
 
     block_S = chunk_size
     O_tilelang = prepare_output(B, S, H, DK, DV, chunk_size, output_dtype_torch)
-    program = tilelang_chunk_fwd_o(B, S, H, DK, DV, input_dtype, output_dtype, accum_dtype, gate_dtype, chunk_size, scale, use_g, block_S, block_DK, block_DV, threads, num_stages)
-    kernel = tilelang.compile(program)
-    # kernel = tilelang.compile(program, pass_configs={"tl.disable_tma_lower": True, "tl.disable_warp_specialized": True})
-    kernel(Q, K, V, HIDDEN, G, O_tilelang)
+    jit_kernel = tilelang_chunk_fwd_o(B, S, H, DK, DV, input_dtype, output_dtype, accum_dtype, gate_dtype, chunk_size, scale, use_g, block_S, block_DK, block_DV, threads, num_stages)
+    O_tilelang = jit_kernel(Q, K, V, HIDDEN, G)
 
     try:
         torch.testing.assert_close(O_tilelang, O_ref, rtol=1e-2, atol=1e-2)

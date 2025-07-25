@@ -45,7 +45,7 @@ def prepare_output(
     A = torch.empty(B, S, H, BS, dtype=dtype).cuda()
     return A
 
-
+@tilelang.jit(out_idx=[-1])
 def tilelang_chunk_scaled_dot_kkt_fwd(
     # task config
     B,
