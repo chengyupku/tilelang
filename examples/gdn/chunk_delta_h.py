@@ -1,37 +1,9 @@
-# Copyright (c) Tile-AI Corporation.
-# Licensed under the MIT License.
-import sys
-import os
-# (zhengju) To use the debug code, you need to set the modified tilelang repository path to sys.path
-# sys.path.insert(0, "/root/workspace/tilelang")
-
 import tilelang
 import tilelang.language as T
-
-# Add your fla repository path to sys.path
-# You can set the FLA_REPO_PATH environment variable to point to your fla repository
-# Currently we use the fla repository from the flash-linear-attention project at commit id f03cb3ae
-
-# sys.path.insert(0, "/root/workspace/flash-linear-attention")
-# import fla
-# print(fla.__file__)
-
 from fla.ops.common.chunk_delta_h import chunk_gated_delta_rule_fwd_h
 import torch
-from tilelang.engine.callback import register_cuda_postproc_callback
-
-
-# (zhengju) Now we slightly modify the generated cuda code from tilelang lower in
-# the debug folder to make the performance better. To disable this callback,
-# you can just comment out the following function.
-# @register_cuda_postproc_callback
-# def tilelang_callback_cuda_postproc(code, _):
-#     cuda_code = open("../debug/chunk_delta_h_fuse.cu", "r").read()
-#     code = cuda_code
-#     return code
 
 torch.random.manual_seed(0)
-
 tilelang.disable_cache()
 
 

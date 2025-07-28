@@ -65,25 +65,32 @@ def test_chunk_gdn(
 
     # backward
     def run_bwd():
+        q.grad = k.grad = v.grad = beta.grad = g.grad = h0.grad = None
         ((tri * do).sum() + (tri_ht * dht).sum()).backward(retain_graph=True)
-        return do, dht
+        tri_dq, tri_dk, tri_dv, tri_dbeta, tri_dg, tri_dh0 = q.grad, k.grad, v.grad, beta.grad, g.grad, h0.grad
+        return tri_dq, tri_dk, tri_dv, tri_dbeta, tri_dg, tri_dh0
 
     def run_tilelang_bwd():
+        q.grad = k.grad = v.grad = beta.grad = g.grad = h0.grad = None
         ((o_tilelang * do).sum() + (final_state_tilelang * dht).sum()).backward(retain_graph=True)
-        return do, dht
+        tl_dq, tl_dk, tl_dv, tl_dbeta, tl_dg, tl_dh0 = q.grad, k.grad, v.grad, beta.grad, g.grad, h0.grad
+        return tl_dq, tl_dk, tl_dv, tl_dbeta, tl_dg, tl_dh0
 
     fla_fwd_latency = do_bench(run_fwd, warmup=500)
     print("fla fwd: {:.2f} ms".format(fla_fwd_latency))
     tilelang_fwd_latency = do_bench(run_tilelang_fwd, warmup=500)
     print("tilelang fwd: {:.2f} ms".format(tilelang_fwd_latency))
-    # bwd_latency = do_bench(run_bwd, warmup=500)
-    # print("bwd: {:.2f} ms".format(bwd_latency))
 
-    fla_do, fla_dht = run_bwd()
-    tilelang_do, tilelang_dht = run_tilelang_bwd()
-    assert_similar(tilelang_do, fla_do, name="do", raise_assert=False)
-    assert_similar(tilelang_dht, fla_dht, name="dht", raise_assert=False)
-
+    tri_dq, tri_dk, tri_dv, tri_dbeta, tri_dg, tri_dh0 = run_bwd()
+    tl_dq, tl_dk, tl_dv, tl_dbeta, tl_dg, tl_dh0 = run_tilelang_bwd()
+    assert_similar(tri_dq, tl_dq, name="dq", raise_assert=False)
+    assert_similar(tri_dk, tl_dk, name="dk", raise_assert=False)
+    assert_similar(tri_dv, tl_dv, name="dv", raise_assert=False)
+    assert_similar(tri_dbeta, tl_dbeta, name="dbeta", raise_assert=False)
+    assert_similar(tri_dg, tl_dg, name="dg", raise_assert=False)
+    assert_similar(tri_dh0, tl_dh0, name="dh0", raise_assert=False)
+    
+    
     fla_bwd_latency = do_bench(run_bwd, warmup=500)
     print("fla bwd: {:.2f} ms".format(fla_bwd_latency))
     tilelang_bwd_latency = do_bench(run_tilelang_bwd, warmup=500)

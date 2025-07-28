@@ -1,18 +1,6 @@
-# Copyright (c) Tile-AI Corporation.
-# Licensed under the MIT License.
-
-import sys
-
 import tilelang
 import tilelang.language as T
-print(tilelang.__file__)
-
-# Add your fla repository path to sys.path
-# You can set the FLA_REPO_PATH environment variable to point to your fla repository
-# Currently we use the fla repository from the flash-linear-attention project at commit id f03cb3ae
-
 import fla
-print(fla.__file__)
 
 # from fla.ops.gated_delta_rule.wy_fast import prepare_wy_repr_bwd
 from triton_wy_bwd import bwd_prepare_wy_repr
@@ -21,8 +9,6 @@ import torch
 from utils import assert_similar
 
 torch.random.manual_seed(0)
-torch.set_printoptions(profile="full")
-
 tilelang.disable_cache()
 
 

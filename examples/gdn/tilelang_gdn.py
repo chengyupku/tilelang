@@ -1,6 +1,3 @@
-# -*- coding: utf-8 -*-
-# Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
-
 import warnings
 from typing import Optional
 
@@ -8,10 +5,8 @@ import torch
 from einops import rearrange
 
 from fla.modules.l2norm import l2norm_bwd, l2norm_fwd
-from fla.ops.common.chunk_delta_h import chunk_gated_delta_rule_bwd_dhu, chunk_gated_delta_rule_fwd_h
-from fla.ops.common.chunk_o import chunk_bwd_dqkwg, chunk_bwd_dv_local, chunk_fwd_o
-from fla.ops.common.chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
-from fla.ops.gated_delta_rule.wy_fast import prepare_wy_repr_bwd, recompute_w_u_fwd
+from fla.ops.common.chunk_o import chunk_bwd_dv_local
+from fla.ops.gated_delta_rule.wy_fast import prepare_wy_repr_bwd
 from fla.ops.utils import chunk_local_cumsum, solve_tril
 from fla.utils import autocast_custom_bwd, autocast_custom_fwd, input_guard
 
@@ -21,6 +16,8 @@ from chunk_scaled_dot_kkt import tilelang_chunk_scaled_dot_kkt_fwd
 from chunk_delta_h import tilelang_chunk_gated_delta_rule_fwd_h
 from chunk_o import tilelang_chunk_fwd_o
 from chunk_delta_bwd import tilelang_chunk_gated_delta_rule_bwd_dhu
+from wy_fast import tilelang_recompute_w_u_fwd
+from chunk_o_bwd import tilelang_chunk_o_bwd_dqkwg
 
 tilelang.disable_cache()
 
@@ -56,13 +53,12 @@ def tilelang_chunk_gated_delta_rule_fwd(
         cu_seqlens=cu_seqlens,
         output_dtype=k.dtype
     )
-    w, u = recompute_w_u_fwd(
-        k=k,
-        v=v,
-        beta=beta,
-        A=A,
-        g_cumsum=g,
-        cu_seqlens=cu_seqlens,
+    w, u = tilelang_recompute_w_u_fwd(B, S, H, DK, DV, input_dtype, output_dtype, gate_dtype, accum_dtype, chunk_size, block_S=chunk_size, block_DK=64, block_DV=32, threads=128, num_stages=3)(
+        k,
+        v,
+        beta,
+        g,
+        A,
     )
     h, final_state, v_new = tilelang_chunk_gated_delta_rule_fwd_h(B, S, H, DK, DV, input_dtype, output_dtype, accum_dtype, gate_dtype, state_dtype, chunk_size, use_g=True, use_initial_state=True, store_final_state=True, save_new_value=True, block_DK=64, block_DV=32, threads=128, num_stages=1)(
         k,
@@ -101,16 +97,16 @@ def tilelang_chunk_gated_delta_rule_bwd(
     gate_dtype="float32"
     state_dtype="float32"
     chunk_size=64
+    use_g= True
     
-    w, u = recompute_w_u_fwd(
-        k=k,
-        v=v,
-        beta=beta,
-        A=A,
-        g_cumsum=g,
-        cu_seqlens=cu_seqlens,
+    w, u = tilelang_recompute_w_u_fwd(B, S, H, DK, DV, input_dtype, output_dtype, gate_dtype, accum_dtype, chunk_size, block_S=chunk_size, block_DK=64, block_DV=32, threads=128, num_stages=3)(
+        k,
+        v,
+        beta,
+        g,
+        A,
     )
-    h, _, v_new = tilelang_chunk_gated_delta_rule_fwd_h(B, S, H, DK, DV, input_dtype, output_dtype, accum_dtype, gate_dtype, state_dtype, chunk_size, use_g=True, use_initial_state=True, store_final_state=True, save_new_value=True, block_DK=64, block_DV=32, threads=128, num_stages=1)(
+    h, _, v_new = tilelang_chunk_gated_delta_rule_fwd_h(B, S, H, DK, DV, input_dtype, output_dtype, accum_dtype, gate_dtype, state_dtype, chunk_size, use_g=use_g, use_initial_state=True, store_final_state=True, save_new_value=True, block_DK=64, block_DV=32, threads=128, num_stages=1)(
         k,
         w,
         u,
@@ -125,7 +121,7 @@ def tilelang_chunk_gated_delta_rule_bwd(
         scale=scale,
         cu_seqlens=cu_seqlens,
     )
-    dh, dh0, dv = tilelang_chunk_gated_delta_rule_bwd_dhu(B, S, H, DK, DV, input_dtype, output_dtype, accum_dtype, gate_dtype, state_dtype, chunk_size, scale, use_g=True, use_initial_state=True, use_final_state_gradient=True, block_DV=32, threads=128, num_stages=1)(
+    dh, dh0, dv = tilelang_chunk_gated_delta_rule_bwd_dhu(B, S, H, DK, DV, input_dtype, output_dtype, accum_dtype, gate_dtype, state_dtype, chunk_size, scale, use_g=use_g, use_initial_state=True, use_final_state_gradient=True, block_DV=32, threads=128, num_stages=1)(
         q,
         k,
         w,
@@ -135,19 +131,19 @@ def tilelang_chunk_gated_delta_rule_bwd(
         do,
         dv,
     )
-    dq, dk, dw, dg = chunk_bwd_dqkwg(
-        q=q,
-        k=k,
-        v=v_new,
-        w=w,
-        g=g,
-        h=h,
-        dv=dv,
-        do=do,
-        dh=dh,
-        scale=scale,
-        cu_seqlens=cu_seqlens,
+    dq, dk, dw, dg = tilelang_chunk_o_bwd_dqkwg(B, S, H, DK, DV, input_dtype, output_dtype, accum_dtype, gate_dtype, state_dtype, chunk_size, scale, use_g=use_g, use_dw=True, block_DK=64, block_DV=64, threads=128, num_stages=0)(
+        q,
+        k,
+        v_new,
+        h,
+        g,
+        do,
+        dh,
+        dv,
+        w,
     )
+    if use_g:
+        dg = dg.sum(dim=0)
     dk2, dv, db, dg2 = prepare_wy_repr_bwd(
         k=k,
         v=v,

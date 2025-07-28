@@ -1,21 +1,8 @@
-# Copyright (c) Tile-AI Corporation.
-# Licensed under the MIT License.
-
 import tilelang
 import tilelang.language as T
 import sys
-
-# Add your fla repository path to sys.path
-# You can set the FLA_REPO_PATH environment variable to point to your fla repository
-# Currently we use the fla repository from the flash-linear-attention project at commit id f03cb3ae
-
-# sys.path.insert(0, "/root/workspace/flash-linear-attention")
-# import fla
-# print(fla.__file__)
-
 from fla.ops.common.chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
 import torch
-torch.set_printoptions(profile="full")
 torch.random.manual_seed(0)
 
 tilelang.disable_cache()
