@@ -343,11 +343,14 @@ class TensorCoreIntrinEmitter:
 
         return _warp_ldmatrix_b(B_local_buf, B_shared_buf, ki, thread_binding, rk)
 
-    def mma(self,
-            A_local_buf: Buffer,
-            B_local_buf: Buffer,
-            C_local_buf: Buffer,
-            k_inner: PrimExpr | None = 0):
+    def mma(
+        self,
+        A_local_buf: Buffer,
+        B_local_buf: Buffer,
+        C_local_buf: Buffer,
+        k_inner: PrimExpr | None = 0,
+        # If True, simulate the MMA with CIM mode using A as a proxy for B
+        cim_simulate: bool = False):
         warp_rows = self.warp_rows if self.fake_warp_rows is None else self.fake_warp_rows
         warp_cols = self.warp_cols if self.fake_warp_cols is None else self.fake_warp_cols
         local_size_a = self.local_size_a
@@ -383,6 +386,8 @@ class TensorCoreIntrinEmitter:
                     C_local_buf.data,
                     i * warp_cols * local_size_out + j * local_size_out,
                     T.bool(False),  # saturate
+                    None,
+                    cim_simulate,
                 )
                 if replicate_b:
                     T.ptx_mma(
@@ -401,6 +406,8 @@ class TensorCoreIntrinEmitter:
                         i * warp_cols * local_size_out + j * local_size_out +
                         lift(local_size_out) // 2,
                         T.bool(False),  # saturate
+                        None,
+                        cim_simulate,
                     )
 
         return _warp_mma(A_local_buf, B_local_buf, C_local_buf)

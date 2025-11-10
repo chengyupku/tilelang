@@ -156,7 +156,7 @@ def tl_matmul(
                     # mma_emitter.ldmatrix_b(B_local, B_shared, ki)
 
                     # Perform Matrix Multiplication
-                    mma_emitter.mma(A_local, B_shared, C_local)
+                    mma_emitter.mma(A_local, B_shared, C_local, cim_simulate=True)
 
             # Perform STMatrix
             mma_emitter.stmatrix(C_local, C_shared)

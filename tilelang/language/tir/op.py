@@ -886,6 +886,7 @@ def ptx_mma(
     c_index,
     saturate,
     operator=None,
+    cim_simulate: bool = False,
 ):
     """TVM intrinsic for ptx tensor core mma instructions
     https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#warp-level-matrix-instructions-for-mma
@@ -936,14 +937,18 @@ def ptx_mma(
 
     operator : Optional[Literal["xor", "and"]]
         The 1-bit operator.
+    cim_simulate : bool, default False
+        If True, lower to the CIM simulation path in tl mma templates.
 
     Returns
     -------
     call : PrimExpr
         The call expression.
     """
-    return _tvm_op.ptx_mma(
-        dtype,
+    # Build arguments list for the TIR call. We intentionally use call_intrin
+    # with Op.get("tir.ptx_mma") to allow an optional trailing cim_simulate
+    # flag without being restricted by upstream wrapper arity.
+    args = [
         shape,
         A_layout,
         B_layout,
@@ -957,8 +962,12 @@ def ptx_mma(
         accumulator,
         c_index,
         saturate,
-        operator,
-    )
+    ]
+    if operator is not None:
+        args.append(operator)
+    if cim_simulate:
+        args.append(const(True))
+    return call_intrin(dtype, _tvm_op.Op.get("tir.ptx_mma"), *args)
 
 
 def ptx_mma_sp(

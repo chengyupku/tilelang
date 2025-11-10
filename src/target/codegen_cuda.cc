@@ -1726,7 +1726,7 @@ void CodeGenTileLangCUDA::VisitExpr_(const CallNode *op, std::ostream &os) {
     // arg 11: C accumulator index
     // arg 12: saturate
     // arg 13: (optional) 1-bit operator (xor or and)
-    ICHECK(op->args.size() == 13U || op->args.size() == 14U);
+    ICHECK(op->args.size() >= 13U && op->args.size() <= 15U);
     std::string shape = Downcast<StringImm>(op->args[0])->value;
     std::string A_layout = Downcast<StringImm>(op->args[1])->value;
     std::string B_layout = Downcast<StringImm>(op->args[2])->value;
@@ -1745,10 +1745,31 @@ void CodeGenTileLangCUDA::VisitExpr_(const CallNode *op, std::ostream &os) {
     auto [m, n, k] = tl::codegen::ptx::ParseMMAShape(shape);
 
     need_mma_instruction_h_ = true;
+    // Saturate flag is at fixed position 12.
+    bool saturate_flag = false;
+    if (const auto *imm = op->args[12].as<IntImmNode>()) {
+      saturate_flag = (imm->value != 0);
+    }
+    // Optional CimSimulate flag is the last argument when provided.
+    bool cim_flag = false;
+    if (op->args.size() == 15U) {
+      // args[13] is 1-bit operator string, args[14] is cim flag
+      if (const auto *imm = op->args[14].as<IntImmNode>()) {
+        cim_flag = (imm->value != 0);
+      }
+    } else if (op->args.size() == 14U) {
+      // args[13] could be op string or cim flag; detect by type
+      if (op->args[13].as<StringImmNode>() == nullptr) {
+        if (const auto *imm = op->args[13].as<IntImmNode>()) {
+          cim_flag = (imm->value != 0);
+        }
+      }
+    }
     this->PrintIndent();
     std::string mma_call =
         "tl::mma_sync<(AType), (BType), (CType), (M), (N), (K), (TransA), "
-        "(TransB)>(reinterpret_cast<(CRegType)*>((C_ptr) + (C_offset)), "
+        "(TransB), (Saturate), (CimSim)>(reinterpret_cast<(CRegType)*>((C_ptr) "
+        "+ (C_offset)), "
         "reinterpret_cast<const (ARegType)*>((A_ptr) + (A_offset)), "
         "reinterpret_cast<const (BRegType)*>((B_ptr) + (B_offset)));\n";
     tl::codegen::Replacer replacer;
@@ -1781,6 +1802,10 @@ void CodeGenTileLangCUDA::VisitExpr_(const CallNode *op, std::ostream &os) {
     replacer.register_rule("(K)", std::to_string(k));
     replacer.register_rule("(TransA)", A_layout == "row" ? "false" : "true");
     replacer.register_rule("(TransB)", B_layout == "row" ? "false" : "true");
+    replacer.register_rule("(Saturate)", saturate_flag ? std::string("true")
+                                                       : std::string("false"));
+    replacer.register_rule("(CimSim)", cim_flag ? std::string("true")
+                                                : std::string("false"));
     replacer.register_rule("(ARegType)", ARegType);
     replacer.register_rule("(BRegType)", BRegType);
     replacer.register_rule("(CRegType)",

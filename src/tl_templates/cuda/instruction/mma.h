@@ -40,6 +40,33 @@ call_fma_impl(typename MmaImplTraits<Impl>::DReg *d,
   Impl::fma(d[DIdx]..., a[AIdx]..., b[BIdx]..., c[CIdx]...);
 }
 
+template <class Impl, size_t... DIdx, size_t... AIdx, size_t... BIdx,
+          size_t... CIdx>
+TL_DEVICE void call_fma_cim_simulation_impl(
+    typename MmaImplTraits<Impl>::DReg *d,
+    const typename MmaImplTraits<Impl>::AReg *a,
+    const typename MmaImplTraits<Impl>::BReg *b,
+    const typename MmaImplTraits<Impl>::CReg *c, std::index_sequence<DIdx...>,
+    std::index_sequence<AIdx...>, std::index_sequence<BIdx...>,
+    std::index_sequence<CIdx...>) {
+  using BReg = typename MmaImplTraits<Impl>::BReg;
+  (void)b; // unused in CIM simulation path
+  Impl::fma(d[DIdx]..., a[AIdx]..., static_cast<BReg>(a[BIdx])..., c[CIdx]...);
+}
+
+template <class Impl>
+TL_DEVICE void
+call_fma_cim_simulation(typename MmaImplTraits<Impl>::DReg *d,
+                        const typename MmaImplTraits<Impl>::AReg *a,
+                        const typename MmaImplTraits<Impl>::BReg *b,
+                        const typename MmaImplTraits<Impl>::CReg *c) {
+  call_fma_cim_simulation_impl<Impl>(
+      d, a, b, c, std::make_index_sequence<MmaImplTraits<Impl>::kDRegs>{},
+      std::make_index_sequence<MmaImplTraits<Impl>::kARegs>{},
+      std::make_index_sequence<MmaImplTraits<Impl>::kBRegs>{},
+      std::make_index_sequence<MmaImplTraits<Impl>::kCRegs>{});
+}
+
 template <class Impl>
 TL_DEVICE void call_fma(typename MmaImplTraits<Impl>::DReg *d,
                         const typename MmaImplTraits<Impl>::AReg *a,
@@ -53,7 +80,7 @@ TL_DEVICE void call_fma(typename MmaImplTraits<Impl>::DReg *d,
 }
 
 template <DataType AType, DataType BType, DataType CType, int M, int N, int K,
-          bool TransA, bool TransB, bool Saturate>
+          bool TransA, bool TransB, bool Saturate, bool CimSimulate = false>
 struct MmaDispatcher {
   using CRegType = void;
   using ARegType = void;
@@ -69,10 +96,10 @@ struct MmaDispatcher {
 #define TL_DEFINE_MMA_DISPATCHER(ATypeEnum, BTypeEnum, CTypeEnum, MValue,      \
                                  NValue, KValue, TransAValue, TransBValue,     \
                                  SaturateValue, ImplType)                      \
-  template <>                                                                  \
+  template <bool CimSimulate>                                                  \
   struct MmaDispatcher<DataType::ATypeEnum, DataType::BTypeEnum,               \
                        DataType::CTypeEnum, MValue, NValue, KValue,            \
-                       TransAValue, TransBValue, SaturateValue> {              \
+                       TransAValue, TransBValue, SaturateValue, CimSimulate> { \
     using Impl = ImplType;                                                     \
     using Traits = MmaImplTraits<Impl>;                                        \
     using CRegType = typename Traits::DReg;                                    \
@@ -83,7 +110,11 @@ struct MmaDispatcher {
         "tl::mma_sync requires matching accumulator/output regs");             \
     static TL_DEVICE void exec(CRegType *d, const ARegType *a,                 \
                                const BRegType *b, const CRegType *c) {         \
-      call_fma<Impl>(d, a, b, c);                                              \
+      if constexpr (CimSimulate) {                                             \
+        call_fma_cim_simulation<Impl>(d, a, b, c);                             \
+      } else {                                                                 \
+        call_fma<Impl>(d, a, b, c);                                            \
+      }                                                                        \
     }                                                                          \
   };
 
@@ -141,16 +172,19 @@ TL_DEFINE_MMA_DISPATCHER(kTensorFloat32, kTensorFloat32, kFloat32, 16, 8, 8,
 } // namespace detail
 
 template <DataType AType, DataType BType, DataType CType, int M, int N, int K,
-          bool TransA, bool TransB, bool Saturate = false>
+          bool TransA, bool TransB, bool Saturate = false,
+          bool CimSimulate = false>
 TL_DEVICE void mma_sync(
     typename detail::MmaDispatcher<AType, BType, CType, M, N, K, TransA, TransB,
-                                   Saturate>::CRegType *c,
+                                   Saturate, CimSimulate>::CRegType *c,
     const typename detail::MmaDispatcher<AType, BType, CType, M, N, K, TransA,
-                                         TransB, Saturate>::ARegType *a,
+                                         TransB, Saturate,
+                                         CimSimulate>::ARegType *a,
     const typename detail::MmaDispatcher<AType, BType, CType, M, N, K, TransA,
-                                         TransB, Saturate>::BRegType *b) {
+                                         TransB, Saturate,
+                                         CimSimulate>::BRegType *b) {
   using Dispatcher = detail::MmaDispatcher<AType, BType, CType, M, N, K, TransA,
-                                           TransB, Saturate>;
+                                           TransB, Saturate, CimSimulate>;
   static_assert(!std::is_void_v<typename Dispatcher::CRegType>,
                 "tl::mma_sync: unsupported configuration");
   Dispatcher::exec(c, a, b, c);
