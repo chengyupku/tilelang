@@ -107,6 +107,9 @@ def tl_matmul(
         warp_row_tiles=warp_row_tiles,
         warp_col_tiles=warp_col_tiles,
         chunk=chunk,
+        fake_instr_m=16,
+        fake_instr_n=8,
+        fake_instr_k=16,
         fake_warp_rows=warp_rows,
         fake_warp_cols=warp_cols,
     )
