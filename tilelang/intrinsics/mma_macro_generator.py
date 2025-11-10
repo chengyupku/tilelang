@@ -65,6 +65,8 @@ class TensorCoreIntrinEmitter:
         num_elems_per_byte: int = 1,
         is_m_first: bool | None = False,
         thread_var: Var | None = None,
+        fake_warp_rows: int | None = None,
+        fake_warp_cols: int | None = None,
     ):
         self.a_dtype = a_dtype
         self.b_dtype = b_dtype
@@ -88,6 +90,8 @@ class TensorCoreIntrinEmitter:
         self.threads = self.WARP_SIZE * (block_row_warps * block_col_warps) * reduce_k
         self.num_elems_per_byte = num_elems_per_byte
         self.thread_var = thread_var
+        self.fake_warp_rows = fake_warp_rows
+        self.fake_warp_cols = fake_warp_cols
 
         if self.warp_rows == 0 or self.warp_cols == 0:
             raise ValueError(
@@ -344,8 +348,8 @@ class TensorCoreIntrinEmitter:
             B_local_buf: Buffer,
             C_local_buf: Buffer,
             k_inner: PrimExpr | None = 0):
-        warp_rows = self.warp_rows
-        warp_cols = self.warp_cols
+        warp_rows = self.warp_rows if self.fake_warp_rows is None else self.fake_warp_rows
+        warp_cols = self.warp_cols if self.fake_warp_cols is None else self.fake_warp_cols
         local_size_a = self.local_size_a
         local_size_b = self.local_size_b
         local_size_out = self.local_size_out
