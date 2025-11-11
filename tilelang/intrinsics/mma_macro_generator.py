@@ -83,8 +83,8 @@ class TensorCoreIntrinEmitter:
         self.warp_col_tiles = warp_col_tiles
         self.chunk = chunk
         self.M_dim = 16 if fake_instr_m is None else fake_instr_m
-        self.N_dim = 16 if fake_instr_n is None else fake_instr_n
-        self.K_dim = 16 if fake_instr_k is None else fake_instr_k
+        self.n_dim = 16 if fake_instr_n is None else fake_instr_n
+        self.k_dim = 16 if fake_instr_k is None else fake_instr_k
         self._initialize_k_dim(a_dtype)
         self._initialize_abbrev(a_dtype, b_dtype, accum_dtype)
         self._initialize_micro_size(self.M_dim, self.k_dim)
@@ -148,16 +148,18 @@ class TensorCoreIntrinEmitter:
 
         self.warp_rows = warp_row_tiles // m_dim
 
-        if warp_col_tiles % 16 == 0:
-            self.n_dim = 16
-            self.micro_size_y = 16
-            self.warp_cols = warp_col_tiles // 16
-        else:
-            # must be divisible by 8
-            self.n_dim = 8
-            self.micro_size_y = 8
-            self.warp_cols = warp_col_tiles // 8
+        # if warp_col_tiles % 16 == 0:
+        #     self.n_dim = 16
+        #     self.micro_size_y = 16
+        #     self.warp_cols = warp_col_tiles // 16
+        # else:
+        #     # must be divisible by 8
+        #     self.n_dim = 8
+        #     self.micro_size_y = 8
+        #     self.warp_cols = warp_col_tiles // 8
 
+        self.warp_cols = 1
+        self.micro_size_y = self.n_dim
         self.micro_size_x = m_dim
         self.micro_size_k = k_dim
 

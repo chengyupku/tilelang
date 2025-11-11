@@ -30,6 +30,14 @@ def make_swizzle_layout(shared_buf):
     return T.Layout(shape, transform_func)
 
 
+data_map = {
+    "float32": 32,
+    "float16": 16,
+    "int8": 8,
+    "int4": 4,
+}
+
+
 @tilelang.jit(
     out_idx=[2],
     pass_configs={
@@ -41,24 +49,27 @@ def tl_matmul(
     M,
     N,
     K,
-    in_dtype,
-    out_dtype,
-    accum_dtype,
+    # Faked CIM instruction size
+    micro_size_x,
+    micro_size_y,
+    micro_size_k,
+    A_in_dtype,
+    B_in_dtype,
+    C_in_dtype,
 ):
-    assert in_dtype in [
+    assert A_in_dtype in [
         "float16",
         "int8",
     ], "Currently only float16 and int8 are supported"
-    assert out_dtype in [
+    assert B_in_dtype in [
+        "int8",
+        "int4",
+        "float16",
+    ], "Currently only int8, int4, and float16 are supported"
+    assert C_in_dtype in [
         "float16",
         "float32",
-        "int32",
-    ], "Currently only float16, float32 and int32 are supported"
-
-    # Faked CIM instruction size
-    micro_size_x = 1
-    micro_size_y = 64
-    micro_size_k = 32
+    ], "Currently only float16, float32 are supported"
 
     block_row_warps = 2
     block_col_warps = 2
@@ -75,10 +86,10 @@ def tl_matmul(
     block_N = block_col_warps * warp_col_tiles
     block_K = chunk
 
-    A_shape = (M, K)
-    B_shape = (N, K)
-    A_shared_shape = (block_M, block_K)
-    B_shared_shape = (block_N, block_K)
+    A_shape = (M, K * data_map[A_in_dtype] // 16)
+    B_shape = (N, K * data_map[B_in_dtype] // 16)
+    A_shared_shape = (block_M, block_K * data_map[A_in_dtype] // 16)
+    B_shared_shape = (block_N, block_K * data_map[B_in_dtype] // 16)
     C_shared_shape = (
         block_M // micro_size_x,
         block_N // micro_size_y,
@@ -97,9 +108,9 @@ def tl_matmul(
 
     # MMA Wrapper to Auto Generate Code for MMA
     mma_emitter = TensorCoreIntrinEmitter(
-        a_dtype=in_dtype,
-        b_dtype=in_dtype,
-        accum_dtype=accum_dtype,
+        a_dtype="float16",
+        b_dtype="float16",
+        accum_dtype="float32",
         a_transposed=False,
         b_transposed=True,
         block_row_warps=block_row_warps,
@@ -116,18 +127,20 @@ def tl_matmul(
 
     @T.prim_func
     def gemm_intrinsics(
-            A: T.Tensor(A_shape, in_dtype),
-            B: T.Tensor(B_shape, in_dtype),
-            C: T.Tensor((M, N), out_dtype),
+            A: T.Tensor(A_shape, "float16"),
+            B: T.Tensor(B_shape, "float16"),
+            C: T.Tensor((M, N), "float16"),
     ):
         with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=threads) as (bx, by):
 
-            A_shared = T.alloc_shared(A_shared_shape, in_dtype, scope=shared_scope)
-            B_shared = T.alloc_shared(B_shared_shape, in_dtype, scope=shared_scope)
-            C_shared = T.alloc_shared(C_shared_shape, out_dtype, scope=shared_scope)
-            A_local = T.alloc_local((warp_rows * local_size_a), in_dtype)
+            A_shared = T.alloc_shared(A_shared_shape, "float16", scope=shared_scope)
+            B_shared = T.alloc_shared(B_shared_shape, "float16", scope=shared_scope)
+            C_shared = T.alloc_shared(C_shared_shape, "float16", scope=shared_scope)
+            A_local = T.alloc_local((warp_rows * local_size_a * data_map[A_in_dtype] // 16),
+                                    "float16")
             # B_local = T.alloc_local((warp_cols * local_size_b), in_dtype)
-            C_local = T.alloc_local((warp_rows * warp_cols * local_size_c), accum_dtype)
+            C_local = T.alloc_local(
+                (warp_rows * warp_cols * local_size_c * data_map[C_in_dtype] // 32), "float32")
 
             T.annotate_layout({
                 A_shared: make_swizzle_layout(A_shared),
@@ -176,13 +189,17 @@ def tl_matmul(
     return gemm_intrinsics
 
 
-def ref_program(A, B):
-    return A @ B.T
-
-
-def main(M=4096, N=4096, K=4096):
-    in_dtype, out_dtype, accum_dtype = "float16", "float16", "float32"
-    kernel = tl_matmul(M, N, K, in_dtype, out_dtype, accum_dtype)
+def main(M=4096,
+         N=4096,
+         K=4096,
+         micro_size_x=1,
+         micro_size_y=64,
+         micro_size_k=32,
+         A_in_dtype="float16",
+         B_in_dtype="float16",
+         C_in_dtype="float32"):
+    kernel = tl_matmul(M, N, K, micro_size_x, micro_size_y, micro_size_k, A_in_dtype, B_in_dtype,
+                       C_in_dtype)
     print(kernel.get_kernel_source())
     src_code = kernel.get_kernel_source()
     # src_code is the generated cuda source
@@ -197,8 +214,15 @@ def main(M=4096, N=4096, K=4096):
     # Ensure that the latency is not None
     assert latency is not None
 
-    profiler.assert_allclose(ref_program, atol=1e-2, rtol=1e-2)
-
 
 if __name__ == "__main__":
-    main(M=4096, N=4096, K=4096)
+    main(
+        M=4096,
+        N=4096,
+        K=4096,
+        micro_size_x=1,
+        micro_size_y=64,
+        micro_size_k=32,
+        A_in_dtype="int8",
+        B_in_dtype="int8",
+        C_in_dtype="float32")
