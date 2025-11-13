@@ -6,6 +6,8 @@ from tilelang.intrinsics import get_swizzle_layout
 from tilelang.intrinsics.mma_macro_generator import (
     TensorCoreIntrinEmitter,)
 from tilelang.transform import simplify_prim_func
+from tilelang.profiler import do_bench
+import torch
 
 tilelang.disable_cache()
 
@@ -53,6 +55,14 @@ def tl_matmul(
     micro_size_x,
     micro_size_y,
     micro_size_k,
+    fake_instr_m,
+    fake_instr_n,
+    fake_instr_k,
+    warp_row_tiles,
+    warp_col_tiles,
+    chunk,
+    block_row_warps,
+    block_col_warps,
     A_in_dtype,
     B_in_dtype,
     C_in_dtype,
@@ -71,12 +81,12 @@ def tl_matmul(
         "float32",
     ], "Currently only float16, float32 are supported"
 
-    block_row_warps = 2
-    block_col_warps = 2
-    warp_row_tiles = 64
-    warp_col_tiles = 64
+    # block_row_warps = 2
+    # block_col_warps = 2
+    # warp_row_tiles = 64
+    # warp_col_tiles = 128
     # chunk = 32 if in_dtype == "float16" else 64
-    chunk = 32
+    # chunk = 64
     shared_scope = "shared.dyn"
 
     # Pipeline Stage
@@ -90,21 +100,25 @@ def tl_matmul(
     B_shape = (N, K * data_map[B_in_dtype] // 16)
     A_shared_shape = (block_M, block_K * data_map[A_in_dtype] // 16)
     B_shared_shape = (block_N, block_K * data_map[B_in_dtype] // 16)
+    # Use fake PTX instruction inner tile for safe staging to avoid OOB in stmatrix
     C_shared_shape = (
         block_M // micro_size_x,
         block_N // micro_size_y,
-        micro_size_x,
-        micro_size_y,
+        fake_instr_m,
+        fake_instr_n,
     )
 
     warp_size = 32
     threads = warp_size * (block_row_warps * block_col_warps)
+    # Local fragment sizes follow the real PTX instruction shape
     local_size_a = (micro_size_x * micro_size_k) // warp_size
     # local_size_b = (micro_size_y * micro_size_k) // warp_size
     local_size_c = (micro_size_x * micro_size_y) // warp_size
 
     warp_rows = warp_row_tiles // micro_size_x  # 64 // 1 = 64
     warp_cols = warp_col_tiles // micro_size_y  # 64 // 32 = 2
+    
+    print(f"fake_warp_rows: {warp_rows}, fake_warp_cols: {warp_cols}")
 
     # MMA Wrapper to Auto Generate Code for MMA
     mma_emitter = TensorCoreIntrinEmitter(
@@ -118,9 +132,9 @@ def tl_matmul(
         warp_row_tiles=warp_row_tiles,
         warp_col_tiles=warp_col_tiles,
         chunk=chunk,
-        fake_instr_m=16,
-        fake_instr_n=8,
-        fake_instr_k=16,
+        fake_instr_m=fake_instr_m,
+        fake_instr_n=fake_instr_n,
+        fake_instr_k=fake_instr_k,
         fake_warp_rows=warp_rows,
         fake_warp_cols=warp_cols,
     )
@@ -177,17 +191,19 @@ def tl_matmul(
             # Perform STMatrix
             mma_emitter.stmatrix(C_local, C_shared)
 
-            # Store shared into global
+            # Store shared into global. Use fake_instr_m/n as inner dims to match PTX store layout
             for i, j in T.Parallel(block_M, block_N):
                 C[by * block_M + i, bx * block_N + j] = C_shared[
                     i // micro_size_x,
                     j // micro_size_y,
-                    i % micro_size_x,
-                    j % micro_size_y,
+                    i % fake_instr_m,
+                    j % fake_instr_n,
                 ]
 
     return gemm_intrinsics
 
+def ref_program(A, B):
+    return A @ B
 
 def main(M=4096,
          N=4096,
@@ -195,10 +211,29 @@ def main(M=4096,
          micro_size_x=1,
          micro_size_y=64,
          micro_size_k=32,
+         fake_instr_m=16,
+         fake_instr_n=8,
+         fake_instr_k=16,
+         warp_row_tiles=64,
+         warp_col_tiles=64,
+         chunk=32,
+         block_row_warps=2,
+         block_col_warps=2,
          A_in_dtype="float16",
          B_in_dtype="float16",
          C_in_dtype="float32"):
-    kernel = tl_matmul(M, N, K, micro_size_x, micro_size_y, micro_size_k, A_in_dtype, B_in_dtype,
+    tflops = 2 * M * N * K / 1e12
+    kernel = tl_matmul(M, N, K, micro_size_x, micro_size_y, micro_size_k,
+                       fake_instr_m,
+                        fake_instr_n,
+                        fake_instr_k,
+                       warp_row_tiles,
+                        warp_col_tiles,
+                        chunk,
+                        block_row_warps,
+                        block_col_warps,
+                        A_in_dtype, 
+                        B_in_dtype,
                        C_in_dtype)
     print(kernel.get_kernel_source())
     src_code = kernel.get_kernel_source()
@@ -209,20 +244,47 @@ def main(M=4096,
 
     latency = profiler.do_bench(profiler.func, warmup=25)
 
-    print(latency)
+    print(f"CIM latency:{latency} ms")
+    print(f"CIM TFLOPS: {tflops / (latency / 1e3)}")
+    
+    a = torch.randn((M, K), dtype=torch.float16).cuda()
+    b = torch.randn((K, N), dtype=torch.float16).cuda()
+    torch_latency = do_bench(lambda: ref_program(a, b))
+    
+    print(f"torch latency:{torch_latency} ms")
+    print(f"torch TFLOPS: {tflops / (torch_latency / 1e3)}")
 
     # Ensure that the latency is not None
     assert latency is not None
 
 
 if __name__ == "__main__":
+    # cta_tiles = {
+    #     1: {
+    #         "int4":{(512,64), (256,128), (128,256), (64,512)},
+    #         "int8":{(512,32), (256,64), (128,128), (64,256)},
+    #     },
+    #     2: {
+    #         "int4":{(256,64), (128,128), (64,256), (32,512)},
+    #         "int8":{(256,32), (128,64), (64,128), (32,256)},
+    #     },
+    # }
+    
     main(
-        M=4096,
-        N=4096,
-        K=4096,
+        M=1,
+        N=8192,
+        K=8192,
         micro_size_x=1,
-        micro_size_y=64,
-        micro_size_k=32,
+        micro_size_y=128,
+        micro_size_k=64,
+        fake_instr_m=16,
+        fake_instr_n=8,
+        fake_instr_k=16,
+        warp_row_tiles=2,
+        warp_col_tiles=128,
+        chunk=64,
+        block_row_warps=1,
+        block_col_warps=1,
         A_in_dtype="int8",
-        B_in_dtype="int8",
+        B_in_dtype="int4",
         C_in_dtype="float32")
