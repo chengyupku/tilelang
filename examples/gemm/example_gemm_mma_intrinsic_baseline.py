@@ -143,18 +143,18 @@ if __name__ == "__main__":
     parser.add_argument("--K", type=int, default=8192)
     parser.add_argument("--warp_m", type=int, default=64)
     parser.add_argument("--warp_n", type=int, default=64)
-    parser.add_argument("--chunk", type=int, default=32)
+    parser.add_argument("--chunk", type=int, default=64)
     parser.add_argument("--block_m", type=int, default=128)
     parser.add_argument("--block_n", type=int, default=128)
-    parser.add_argument("--Atype", type=str, default="float16")
-    parser.add_argument("--Wtype", type=str, default="float16")
-    parser.add_argument("--Outtype", type=str, default="float16")
-    parser.add_argument("--acctype", type=str, default="float16")
+    parser.add_argument("--Atype", type=str, default="int8")
+    parser.add_argument("--Wtype", type=str, default="int8")
+    parser.add_argument("--Outtype", type=str, default="int32")
+    parser.add_argument("--acctype", type=str, default="int32")
     parser.add_argument("--stage", type=int, default=3)
     parser.add_argument("--tracekernel", type=str_to_bool, nargs='?',
                         const=True, default=False)
     parser.add_argument("--use_shmem_writeback", type=str_to_bool, nargs='?',
-                        const=True, default=True)
+                        const=True, default=False)
 
     args = parser.parse_args()
     
