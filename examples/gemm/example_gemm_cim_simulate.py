@@ -121,7 +121,7 @@ def tl_matmul(
     A_shape = (M, K * data_map[A_in_dtype] // 16)
     B_shape = (N, K * data_map[B_in_dtype] // 16)
     # To align with cp_async<16> instruction, we need to over allocate shared memory for A and B
-    Ak = T.max(block_K * data_map[A_in_dtype] // 16, block_row_warps * block_col_warps * 32 * 16 // (data_map[A_in_dtype] // 8))
+    Ak = T.max(block_K * data_map[A_in_dtype] // 16, block_row_warps * block_col_warps * 32 * 16 // (data_map[A_in_dtype] // 8) // block_M)
     A_shared_shape = (block_M, Ak)
     B_shared_shape = (block_N, block_K * data_map[B_in_dtype] // 16)
     # Use fake PTX instruction inner tile for safe staging to avoid OOB in stmatrix
