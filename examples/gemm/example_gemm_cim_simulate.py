@@ -289,8 +289,8 @@ def main(M=4096,
     if tracekernel == True:
         A_shape = (M, K * data_map[A_in_dtype] // 16)
         B_shape = (N, K * data_map[B_in_dtype] // 16)
-        a = torch.ones(A_shape, dtype=torch.float16).cuda()
-        b = torch.ones(B_shape, dtype=torch.float16).cuda()
+        a = torch.zeros(A_shape, dtype=torch.float16).cuda()
+        b = torch.zeros(B_shape, dtype=torch.float16).cuda()
         _ = kernel(a, b)
         return
 
@@ -334,31 +334,31 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--M", type=int, default=8192)
+    parser.add_argument("--M", type=int, default=1)
     parser.add_argument("--N", type=int, default=8192)
     parser.add_argument("--K", type=int, default=8192)
-    parser.add_argument("--micro_m", type=int, default=16)
-    parser.add_argument("--micro_n", type=int, default=8)
+    parser.add_argument("--micro_m", type=int, default=1)
+    parser.add_argument("--micro_n", type=int, default=128)
     parser.add_argument("--micro_k", type=int, default=32)
     parser.add_argument("--fake_instr_m", type=int, default=16)
     parser.add_argument("--fake_instr_n", type=int, default=8)
     parser.add_argument("--fake_instr_k", type=int, default=16)
-    parser.add_argument("--warp_m", type=int, default=64)
-    parser.add_argument("--warp_n", type=int, default=64)
+    parser.add_argument("--warp_m", type=int, default=1)
+    parser.add_argument("--warp_n", type=int, default=128)
     parser.add_argument("--chunk", type=int, default=64)
-    parser.add_argument("--block_m", type=int, default=128)
+    parser.add_argument("--block_m", type=int, default=1)
     parser.add_argument("--block_n", type=int, default=128)
     parser.add_argument("--Atype", type=str, default="int8")
     parser.add_argument("--Wtype", type=str, default="int8")
-    parser.add_argument("--Outtype", type=str, default="int32")
-    parser.add_argument("--acctype", type=str, default="int32")
+    parser.add_argument("--Outtype", type=str, default="float32")
+    parser.add_argument("--acctype", type=str, default="float32")
     parser.add_argument("--stage", type=int, default=3)
     parser.add_argument("--tracekernel", type=str_to_bool, nargs='?',
                         const=True, default=False)
     parser.add_argument("--use_shmem_writeback", type=str_to_bool, nargs='?',
                         const=True, default=False)
     parser.add_argument("--ldb", type=str_to_bool, nargs='?',
-                        const=True, default=False)
+                        const=True, default=True)
 
     args = parser.parse_args()
 
