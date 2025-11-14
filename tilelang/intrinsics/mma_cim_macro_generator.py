@@ -232,7 +232,7 @@ class TensorCoreIntrinEmitter:
                    rk: PrimExpr | None = 0):
         warp_row_tiles = self.warp_row_tiles
         warp_rows = T.ceildiv(T.ceildiv(warp_row_tiles *
-                     self.chunk, self.WARP_SIZE), 8)  # load 8 fp16 when using ldmatrix_x4
+                     self.micro_size_k, self.WARP_SIZE), 8)  # load 8 fp16 when using ldmatrix_x4
         chunk = self.chunk
         micro_size_x = self.micro_size_x
         micro_size_k = self.micro_size_k

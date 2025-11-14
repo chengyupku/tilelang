@@ -88,6 +88,7 @@ def tl_matmul(
     stage=2,
     use_shmem_writeback=False,
     ldb=False,
+    force_accum_float=True
 ):
     assert A_in_dtype in [
         "float16",
@@ -148,7 +149,7 @@ def tl_matmul(
     mma_emitter = TensorCoreIntrinEmitter(
         a_dtype="float16",
         b_dtype="float16",
-        accum_dtype="float32",
+        accum_dtype=C_in_dtype if not force_accum_float else "float32",
         a_transposed=False,
         b_transposed=True,
         block_row_warps=block_row_warps,
@@ -177,8 +178,10 @@ def tl_matmul(
             A_local = T.alloc_local((T.max(warp_rows * local_size_a * data_map[A_in_dtype] // 16, 1)),
                                     "float16")
             B_local = T.alloc_local((1), "float16")
-            C_local = T.alloc_local(
-                (T.max(warp_rows * warp_cols * local_size_c * data_map[C_in_dtype] // 32, 1)), "float32")
+            if force_accum_float:
+                C_local = T.alloc_local((T.max(warp_rows * warp_cols * local_size_c * data_map[C_in_dtype] // 32, 1)), "float32")
+            else:
+                C_local = T.alloc_local((T.max(warp_rows * warp_cols * local_size_c, 1)), C_in_dtype)
 
             T.annotate_layout({
                 A_shared: make_swizzle_layout(A_shared),
@@ -265,6 +268,7 @@ def main(M=4096,
          tracekernel=False,
          use_shmem_writeback=False,
          ldb=False,
+         force_accum_float=True
 ):
     tflops = 2 * M * N * K / 1e12
     kernel = tl_matmul(M, N, K, micro_size_m, micro_size_n, micro_size_k,
@@ -282,7 +286,8 @@ def main(M=4096,
                        C_out_dtype,
                        stage=stage,
                        use_shmem_writeback=use_shmem_writeback,
-                       ldb=ldb,)
+                       ldb=ldb,
+                       force_accum_float=force_accum_float)
     print(kernel.get_kernel_source())
     # src_code = kernel.get_kernel_source()
     # # src_code is the generated cuda source
@@ -361,6 +366,8 @@ if __name__ == "__main__":
                         const=True, default=True)
     parser.add_argument("--ldb", type=str_to_bool, nargs='?',
                         const=True, default=True)
+    parser.add_argument("--force_accum_float", type=str_to_bool, nargs='?',
+                        const=True, default=True)
 
     args = parser.parse_args()
 
@@ -384,4 +391,5 @@ if __name__ == "__main__":
         tracekernel=args.tracekernel,
         use_shmem_writeback=args.use_shmem_writeback,
         ldb=args.ldb,
+        force_accum_float=args.force_accum_float
     )
