@@ -172,11 +172,11 @@ def tl_matmul(
             A_shared = T.alloc_shared(A_shared_shape, "float16", scope=shared_scope)
             B_shared = T.alloc_shared(B_shared_shape, "float16", scope=shared_scope)
             C_shared = T.alloc_shared(C_shared_shape, "float16", scope=shared_scope)
-            A_local = T.alloc_local((warp_rows * local_size_a * data_map[A_in_dtype] // 16),
+            A_local = T.alloc_local((T.max(warp_rows * local_size_a * data_map[A_in_dtype] // 16, 1)),
                                     "float16")
-            B_local = T.alloc_local((warp_cols * local_size_b * data_map[B_in_dtype] // 16), "float16")
+            B_local = T.alloc_local((T.max(warp_cols * local_size_b * data_map[B_in_dtype] // 16, 1)), "float16")
             C_local = T.alloc_local(
-                (warp_rows * warp_cols * local_size_c * data_map[C_in_dtype] // 32), "float32")
+                (T.max(warp_rows * warp_cols * local_size_c * data_map[C_in_dtype] // 32, 1)), "float32")
 
             T.annotate_layout({
                 A_shared: make_swizzle_layout(A_shared),
