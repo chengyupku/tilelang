@@ -87,6 +87,7 @@ def tl_matmul(
     C_out_dtype,
     stage=2,
     use_shmem_writeback=False,
+    ldb=False,
 ):
     assert A_in_dtype in [
         "float16",
@@ -133,7 +134,7 @@ def tl_matmul(
     threads = warp_size * (block_row_warps * block_col_warps)
     # Local fragment sizes follow the real PTX instruction shape
     local_size_a = (micro_size_m * micro_size_k) // warp_size
-    # local_size_b = (micro_size_n * micro_size_k) // warp_size
+    local_size_b = (micro_size_n * micro_size_k) // warp_size
     local_size_c = (micro_size_m * micro_size_n) // warp_size
 
     warp_rows = warp_row_tiles // micro_size_m  # 64 // 1 = 64
@@ -173,7 +174,7 @@ def tl_matmul(
             C_shared = T.alloc_shared(C_shared_shape, "float16", scope=shared_scope)
             A_local = T.alloc_local((warp_rows * local_size_a * data_map[A_in_dtype] // 16),
                                     "float16")
-            # B_local = T.alloc_local((warp_cols * local_size_b), in_dtype)
+            B_local = T.alloc_local((warp_cols * local_size_b * data_map[B_in_dtype] // 16), "float16")
             C_local = T.alloc_local(
                 (warp_rows * warp_cols * local_size_c * data_map[C_in_dtype] // 32), "float32")
 
@@ -202,9 +203,10 @@ def tl_matmul(
                     # Load A into fragment
                     mma_emitter.ldmatrix_a(A_local, A_shared, ki)
 
-                    # Do not need to use ldmatrix for B because
-                    # weight is in CIM
-                    # mma_emitter.ldmatrix_b(B_local, B_shared, ki)
+                    if ldb and ki == 0 and ko == 0:
+                        # Do not need to use ldmatrix for B because
+                        # weight is in CIM
+                        mma_emitter.ldmatrix_b(B_local, B_shared, ki)
 
                     # Perform Matrix Multiplication
                     mma_emitter.mma(A_local, B_shared, C_local, cim_simulate=True)
@@ -260,6 +262,7 @@ def main(M=4096,
          stage=2,
          tracekernel=False,
          use_shmem_writeback=False,
+         ldb=False,
 ):
     tflops = 2 * M * N * K / 1e12
     kernel = tl_matmul(M, N, K, micro_size_m, micro_size_n, micro_size_k,
@@ -276,7 +279,8 @@ def main(M=4096,
                        C_in_dtype,
                        C_out_dtype,
                        stage=stage,
-                       use_shmem_writeback=use_shmem_writeback,)
+                       use_shmem_writeback=use_shmem_writeback,
+                       ldb=ldb,)
     print(kernel.get_kernel_source())
     # src_code = kernel.get_kernel_source()
     # # src_code is the generated cuda source
@@ -353,6 +357,8 @@ if __name__ == "__main__":
                         const=True, default=False)
     parser.add_argument("--use_shmem_writeback", type=str_to_bool, nargs='?',
                         const=True, default=False)
+    parser.add_argument("--ldb", type=str_to_bool, nargs='?',
+                        const=True, default=False)
 
     args = parser.parse_args()
 
@@ -375,4 +381,5 @@ if __name__ == "__main__":
         stage=args.stage,
         tracekernel=args.tracekernel,
         use_shmem_writeback=args.use_shmem_writeback,
+        ldb=args.ldb,
     )
