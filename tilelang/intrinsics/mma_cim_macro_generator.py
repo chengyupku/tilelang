@@ -333,7 +333,8 @@ class TensorCoreIntrinEmitter:
             tx, warp_n, _ = self.extract_thread_binding(thread_binding)
             trans = not b_transposed
 
-            for i in T.serial(warp_cols):
+            # Simulate
+            for i in T.serial(1):
                 # Assign B_shared_elem
                 wi, wk = (
                     warp_n * warp_col_tiles + i * micro_size_y,

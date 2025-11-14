@@ -176,7 +176,7 @@ def tl_matmul(
             C_shared = T.alloc_shared(C_shared_shape, "float16", scope=shared_scope)
             A_local = T.alloc_local((T.max(warp_rows * local_size_a * data_map[A_in_dtype] // 16, 1)),
                                     "float16")
-            B_local = T.alloc_local((T.max(warp_cols * local_size_b * data_map[B_in_dtype] // 16, 1)), "float16")
+            B_local = T.alloc_local((1), "float16")
             C_local = T.alloc_local(
                 (T.max(warp_rows * warp_cols * local_size_c * data_map[C_in_dtype] // 32, 1)), "float32")
 
@@ -198,7 +198,7 @@ def tl_matmul(
 
                 # Load B into shared memory
                 for j, k in T.Parallel(block_N, block_K * data_map[B_in_dtype] // 16):
-                    B_shared[j, k] = B[bx * block_N + j, ko * block_K * data_map[A_in_dtype] // 16 + k]
+                    B_shared[j, k] = B[bx * block_N + j, ko * block_K * data_map[B_in_dtype] // 16 + k]
 
                 for ki in T.serial(0, (block_K // micro_size_k)):
 
