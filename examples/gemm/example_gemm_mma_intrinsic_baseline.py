@@ -32,7 +32,7 @@ def main(
     stage,
     tracekernel,
     use_shmem_writeback,
-    use_zero_benchmark=False
+    use_zero_benchmark=True
 ):
     kernel = tl_matmul(
         M,
@@ -53,7 +53,7 @@ def main(
 
     # Get CUDA Source
     source = kernel.get_kernel_source()
-    print(source)
+    # print(source)
 
     A_in_dtype = map_torch_type(A_in_dtype)
     B_in_dtype = map_torch_type(B_in_dtype)
@@ -88,6 +88,9 @@ def main(
             B = torch.randn(N, K).to(B_in_dtype).cuda() - 0.5
 
     C = kernel(A, B)
+    
+    if tracekernel:
+        return
 
     # # Get Reference Result
     # if in_dtype == torch.int8:
@@ -135,14 +138,14 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--M", type=int, default=8192)
+    parser.add_argument("--M", type=int, default=64)
     parser.add_argument("--N", type=int, default=8192)
     parser.add_argument("--K", type=int, default=8192)
-    parser.add_argument("--warp_m", type=int, default=64)
+    parser.add_argument("--warp_m", type=int, default=32)
     parser.add_argument("--warp_n", type=int, default=64)
     parser.add_argument("--chunk", type=int, default=64)
-    parser.add_argument("--block_m", type=int, default=128)
-    parser.add_argument("--block_n", type=int, default=128)
+    parser.add_argument("--block_m", type=int, default=32)
+    parser.add_argument("--block_n", type=int, default=256)
     parser.add_argument("--Atype", type=str, default="int8")
     parser.add_argument("--Wtype", type=str, default="int8")
     parser.add_argument("--Outtype", type=str, default="int32")
