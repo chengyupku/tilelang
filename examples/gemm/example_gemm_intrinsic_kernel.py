@@ -38,7 +38,8 @@ def tl_matmul(
     B_in_dtype,
     C_in_dtype,
     C_out_dtype,
-    stage
+    stage,
+    use_shmem_writeback,
 ):
     assert A_in_dtype in [
         "float16",
@@ -147,16 +148,27 @@ def tl_matmul(
                     # Perform Matrix Multiplication
                     mma_emitter.mma(A_local, B_local, C_local)
 
-            # Perform STMatrix
-            mma_emitter.stmatrix(C_local, C_shared)
+            if use_shmem_writeback:
+                # Perform STMatrix
+                mma_emitter.stmatrix(
+                    C_local,
+                    C_shared,
+                )
 
-            # Store shared into global
-            for i, j in T.Parallel(block_M, block_N):
-                C[by * block_M + i, bx * block_N + j] = C_shared[
-                    i // micro_size_x,
-                    j // micro_size_y,
-                    i % micro_size_x,
-                    j % micro_size_y,
-                ]
+                # Store shared into global
+                for i, j in T.Parallel(block_M, block_N):
+                    C[by * block_M + i, bx * block_N + j] = C_shared[
+                        i // micro_size_x,
+                        j // micro_size_y,
+                        i % micro_size_x,
+                        j % micro_size_y,
+                    ]
+            else:
+                mma_emitter.stmatrix(
+                    C_local,
+                    C,
+                    pid_m=by,
+                    pid_n=bx,
+                )
 
     return gemm_intrinsics

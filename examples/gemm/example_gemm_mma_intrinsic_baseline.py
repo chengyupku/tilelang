@@ -31,6 +31,7 @@ def main(
     C_out_dtype,
     stage,
     tracekernel,
+    use_shmem_writeback,
     use_zero_benchmark=False
 ):
     kernel = tl_matmul(
@@ -47,6 +48,7 @@ def main(
         C_in_dtype,
         C_out_dtype,
         stage=stage,
+        use_shmem_writeback=use_shmem_writeback,
     )
 
     # Get CUDA Source
@@ -139,14 +141,16 @@ if __name__ == "__main__":
     parser.add_argument("--warp_m", type=int, default=64)
     parser.add_argument("--warp_n", type=int, default=64)
     parser.add_argument("--chunk", type=int, default=64)
-    parser.add_argument("--block_m", type=int, default=64)
+    parser.add_argument("--block_m", type=int, default=128)
     parser.add_argument("--block_n", type=int, default=128)
     parser.add_argument("--Atype", type=str, default="int8")
     parser.add_argument("--Wtype", type=str, default="int8")
-    parser.add_argument("--Outtype", type=str, default="float16")
+    parser.add_argument("--Outtype", type=str, default="int32")
     parser.add_argument("--acctype", type=str, default="int32")
     parser.add_argument("--stage", type=int, default=3)
     parser.add_argument("--tracekernel", type=str_to_bool, nargs='?',
+                        const=True, default=False)
+    parser.add_argument("--use_shmem_writeback", type=str_to_bool, nargs='?',
                         const=True, default=False)
 
     args = parser.parse_args()
@@ -166,4 +170,5 @@ if __name__ == "__main__":
         C_out_dtype=args.Outtype,
         stage=args.stage,
         tracekernel=args.tracekernel,
+        use_shmem_writeback=args.use_shmem_writeback,
     )

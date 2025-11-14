@@ -34,6 +34,7 @@ def make_swizzle_layout(shared_buf):
 
 
 data_map = {
+    "int32": 32,
     "float32": 32,
     "float16": 16,
     "int8": 8,
@@ -85,6 +86,7 @@ def tl_matmul(
     C_in_dtype,
     C_out_dtype,
     stage=2,
+    use_shmem_writeback=False,
 ):
     assert A_in_dtype in [
         "float16",
@@ -96,6 +98,7 @@ def tl_matmul(
         "float16",
     ], "Currently only int8, int4, and float16 are supported"
     assert C_in_dtype in [
+        "int32",
         "float16",
         "float32",
     ], "Currently only float16, float32 are supported"
@@ -206,17 +209,28 @@ def tl_matmul(
                     # Perform Matrix Multiplication
                     mma_emitter.mma(A_local, B_shared, C_local, cim_simulate=True)
 
-            # Perform STMatrix
-            mma_emitter.stmatrix(C_local, C_shared)
+            if use_shmem_writeback:
+                # Perform STMatrix
+                mma_emitter.stmatrix(
+                    C_local,
+                    C_shared,
+                )
 
-            # Store shared into global. Use fake_instr_m/n as inner dims to match PTX store layout
-            for i, j in T.Parallel(block_M, block_N):
-                C[by * block_M + i, bx * block_N + j] = C_shared[
-                    i // micro_size_m,
-                    j // micro_size_n,
-                    i % fake_instr_m,
-                    j % fake_instr_n,
-                ]
+                # Store shared into global
+                for i, j in T.Parallel(block_M, block_N):
+                    C[by * block_M + i, bx * block_N + j] = C_shared[
+                        i // micro_size_m,
+                        j // micro_size_n,
+                        i % micro_size_m,
+                        j % micro_size_n,
+                    ]
+            else:
+                mma_emitter.stmatrix(
+                    C_local,
+                    C,
+                    pid_m=by,
+                    pid_n=bx,
+                )
 
     return gemm_intrinsics
 
@@ -245,6 +259,7 @@ def main(M=4096,
          C_out_dtype="float16",
          stage=2,
          tracekernel=False,
+         use_shmem_writeback=False,
 ):
     tflops = 2 * M * N * K / 1e12
     kernel = tl_matmul(M, N, K, micro_size_m, micro_size_n, micro_size_k,
@@ -260,7 +275,8 @@ def main(M=4096,
                        B_in_dtype,
                        C_in_dtype,
                        C_out_dtype,
-                       stage=stage)
+                       stage=stage,
+                       use_shmem_writeback=use_shmem_writeback,)
     print(kernel.get_kernel_source())
     # src_code = kernel.get_kernel_source()
     # # src_code is the generated cuda source
@@ -314,26 +330,28 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--M", type=int, default=1)
+    parser.add_argument("--M", type=int, default=8192)
     parser.add_argument("--N", type=int, default=8192)
     parser.add_argument("--K", type=int, default=8192)
-    parser.add_argument("--micro_m", type=int, default=1)
-    parser.add_argument("--micro_n", type=int, default=128)
-    parser.add_argument("--micro_k", type=int, default=64)
+    parser.add_argument("--micro_m", type=int, default=16)
+    parser.add_argument("--micro_n", type=int, default=8)
+    parser.add_argument("--micro_k", type=int, default=32)
     parser.add_argument("--fake_instr_m", type=int, default=16)
     parser.add_argument("--fake_instr_n", type=int, default=8)
     parser.add_argument("--fake_instr_k", type=int, default=16)
-    parser.add_argument("--warp_m", type=int, default=2)
-    parser.add_argument("--warp_n", type=int, default=128)
+    parser.add_argument("--warp_m", type=int, default=64)
+    parser.add_argument("--warp_n", type=int, default=64)
     parser.add_argument("--chunk", type=int, default=64)
-    parser.add_argument("--block_m", type=int, default=64)
+    parser.add_argument("--block_m", type=int, default=128)
     parser.add_argument("--block_n", type=int, default=128)
     parser.add_argument("--Atype", type=str, default="int8")
-    parser.add_argument("--Wtype", type=str, default="int4")
-    parser.add_argument("--Outtype", type=str, default="float16")
-    parser.add_argument("--acctype", type=str, default="float32")
+    parser.add_argument("--Wtype", type=str, default="int8")
+    parser.add_argument("--Outtype", type=str, default="int32")
+    parser.add_argument("--acctype", type=str, default="int32")
     parser.add_argument("--stage", type=int, default=3)
     parser.add_argument("--tracekernel", type=str_to_bool, nargs='?',
+                        const=True, default=False)
+    parser.add_argument("--use_shmem_writeback", type=str_to_bool, nargs='?',
                         const=True, default=False)
 
     args = parser.parse_args()
@@ -356,4 +374,5 @@ if __name__ == "__main__":
         C_out_dtype=args.Outtype,
         stage=args.stage,
         tracekernel=args.tracekernel,
+        use_shmem_writeback=args.use_shmem_writeback,
     )
