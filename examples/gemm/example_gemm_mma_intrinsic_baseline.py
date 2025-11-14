@@ -31,8 +31,9 @@ def main(
     C_out_dtype,
     stage,
     tracekernel,
+    use_zero_benchmark=False
 ):
-    matmul = tl_matmul(
+    kernel = tl_matmul(
         M,
         N,
         K,
@@ -47,53 +48,53 @@ def main(
         C_out_dtype,
         stage=stage,
     )
-    kernel = tilelang.compile(matmul, out_idx=[2])
 
     # Get CUDA Source
     source = kernel.get_kernel_source()
     print(source)
-    out_path = os.path.join(os.path.dirname(__file__), save_file_name)
-    if isinstance(source, bytes):
-        source = source.decode("utf-8", errors="replace")
-    with open(out_path, "w", encoding="utf-8") as f:
-        f.write(source)
-    print(f"Saved kernel source to: {out_path}")
 
-    in_dtype = map_torch_type(in_dtype)
-    out_dtype = map_torch_type(out_dtype)
-    accum_dtype = map_torch_type(accum_dtype)
+    A_in_dtype = map_torch_type(A_in_dtype)
+    B_in_dtype = map_torch_type(B_in_dtype)
+    C_out_dtype = map_torch_type(C_out_dtype)
+    C_in_dtype = map_torch_type(C_in_dtype)
 
     if use_zero_benchmark:
-        if in_dtype in {torch.int8, torch.int32}:
-            A = torch.zeros((M, K), dtype=torch.int8).to(in_dtype).cuda()
-            B = torch.zeros((N, K), dtype=torch.int8).to(in_dtype).cuda()
-        elif in_dtype in {torch.float8_e4m3fn, torch.float8_e5m2}:
-            A = torch.zeros(M, K).to(in_dtype).cuda()
-            B = torch.zeros(N, K).to(in_dtype).cuda()
+        if A_in_dtype in {torch.int8, torch.int32}:
+            A = torch.zeros((M, K), dtype=torch.int8).to(A_in_dtype).cuda()
+        elif A_in_dtype in {torch.float8_e4m3fn, torch.float8_e5m2}:
+            A = torch.zeros(M, K).to(A_in_dtype).cuda()
         else:
-            A = torch.zeros(M, K).to(in_dtype).cuda() - 0.5
-            B = torch.zeros(N, K).to(in_dtype).cuda() - 0.5
+            A = torch.zeros(M, K).to(A_in_dtype).cuda() - 0.5
+        if B_in_dtype in {torch.int8, torch.int32}:
+            B = torch.zeros((N, K), dtype=torch.int8).to(B_in_dtype).cuda()
+        elif B_in_dtype in {torch.float8_e4m3fn, torch.float8_e5m2}:
+            B = torch.zeros(N, K).to(B_in_dtype).cuda()
+        else:
+            B = torch.zeros(N, K).to(B_in_dtype).cuda() - 0.5
     else:
-        if in_dtype in {torch.int8, torch.int32}:
-            A = torch.randint(-128, 128, (M, K), dtype=torch.int8).to(in_dtype).cuda()
-            B = torch.randint(-128, 128, (N, K), dtype=torch.int8).to(in_dtype).cuda()
-        elif in_dtype in {torch.float8_e4m3fn, torch.float8_e5m2}:
-            A = torch.randn(M, K).to(in_dtype).cuda()
-            B = torch.randn(N, K).to(in_dtype).cuda()
+        if A_in_dtype in {torch.int8, torch.int32}:
+            A = torch.randint(-128, 128, (M, K), dtype=torch.int8).to(A_in_dtype).cuda()
+        elif A_in_dtype in {torch.float8_e4m3fn, torch.float8_e5m2}:
+            A = torch.randn(M, K).to(A_in_dtype).cuda()
         else:
-            A = torch.randn(M, K).to(in_dtype).cuda() - 0.5
-            B = torch.randn(N, K).to(in_dtype).cuda() - 0.5
+            A = torch.randn(M, K).to(A_in_dtype).cuda() - 0.5
+        if B_in_dtype in {torch.int8, torch.int32}:
+            B = torch.randint(-128, 128, (N, K), dtype=torch.int8).to(B_in_dtype).cuda()
+        elif B_in_dtype in {torch.float8_e4m3fn, torch.float8_e5m2}:
+            B = torch.randn(N, K).to(B_in_dtype).cuda()
+        else:
+            B = torch.randn(N, K).to(B_in_dtype).cuda() - 0.5
 
     C = kernel(A, B)
 
-    # Get Reference Result
-    if in_dtype == torch.int8:
-        ref_c = torch._int_mm(A, B.T)
-    else:
-        ref_c = torch.matmul(A.to(torch.float32), B.T.to(torch.float32)).to(out_dtype)
-    # torch.testing.assert_close(C, ref_c, rtol=1e-2, atol=1e-2)
-    # tilelang.testing.torch_assert_close(C, ref_c, rtol=1e-2, atol=1e-2)
-    print("All check passed.")
+    # # Get Reference Result
+    # if in_dtype == torch.int8:
+    #     ref_c = torch._int_mm(A, B.T)
+    # else:
+    #     ref_c = torch.matmul(A.to(torch.float32), B.T.to(torch.float32)).to(out_dtype)
+    # # torch.testing.assert_close(C, ref_c, rtol=1e-2, atol=1e-2)
+    # # tilelang.testing.torch_assert_close(C, ref_c, rtol=1e-2, atol=1e-2)
+    # print("All check passed.")
 
     # benchmark
     if use_zero_benchmark:
@@ -105,45 +106,45 @@ def main(
     total_flops = 2 * M * N * K
     print(f"tilelang TFlops (or Tops): {total_flops / latency * 1e-9} TFlops")
 
-    # benchmark torch
-    def torch_bench(func, *args, **kwargs):
-        # warmup
-        for _ in range(10):
-            func(*args, **kwargs)
-        torch.cuda.synchronize()
-        # bench
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record()
-        for _ in range(100):
-            func(*args, **kwargs)
-        end.record()
-        torch.cuda.synchronize()
-        return start.elapsed_time(end) / 100
-    if in_dtype == torch.int8:
-        latency = torch_bench(torch._int_mm, A, B.T)
-    else:
-        latency = torch_bench(torch.matmul, A, B.T)
-    print(f"torch Latency: {latency}ms")
-    print(f"torch TFlops (or Tops): {total_flops / latency * 1e-9} TFlops")
+    # # benchmark torch
+    # def torch_bench(func, *args, **kwargs):
+    #     # warmup
+    #     for _ in range(10):
+    #         func(*args, **kwargs)
+    #     torch.cuda.synchronize()
+    #     # bench
+    #     start = torch.cuda.Event(enable_timing=True)
+    #     end = torch.cuda.Event(enable_timing=True)
+    #     start.record()
+    #     for _ in range(100):
+    #         func(*args, **kwargs)
+    #     end.record()
+    #     torch.cuda.synchronize()
+    #     return start.elapsed_time(end) / 100
+    # if in_dtype == torch.int8:
+    #     latency = torch_bench(torch._int_mm, A, B.T)
+    # else:
+    #     latency = torch_bench(torch.matmul, A, B.T)
+    # print(f"torch Latency: {latency}ms")
+    # print(f"torch TFlops (or Tops): {total_flops / latency * 1e-9} TFlops")
 
 
 if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--M", type=int, default=1)
+    parser.add_argument("--M", type=int, default=8192)
     parser.add_argument("--N", type=int, default=8192)
     parser.add_argument("--K", type=int, default=8192)
-    parser.add_argument("--warp_m", type=int, default=2)
-    parser.add_argument("--warp_n", type=int, default=128)
+    parser.add_argument("--warp_m", type=int, default=64)
+    parser.add_argument("--warp_n", type=int, default=64)
     parser.add_argument("--chunk", type=int, default=64)
     parser.add_argument("--block_m", type=int, default=64)
     parser.add_argument("--block_n", type=int, default=128)
     parser.add_argument("--Atype", type=str, default="int8")
     parser.add_argument("--Wtype", type=str, default="int8")
     parser.add_argument("--Outtype", type=str, default="float16")
-    parser.add_argument("--acctype", type=str, default="float32")
+    parser.add_argument("--acctype", type=str, default="int32")
     parser.add_argument("--stage", type=int, default=3)
     parser.add_argument("--tracekernel", type=str_to_bool, nargs='?',
                         const=True, default=False)
