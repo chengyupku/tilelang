@@ -367,7 +367,7 @@ if __name__ == "__main__":
     parser.add_argument("--ldb", type=str_to_bool, nargs='?',
                         const=True, default=True)
     parser.add_argument("--force_accum_float", type=str_to_bool, nargs='?',
-                        const=True, default=True)
+                        const=True, default=False)
 
     args = parser.parse_args()
 
