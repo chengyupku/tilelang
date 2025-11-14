@@ -120,7 +120,9 @@ def tl_matmul(
 
     A_shape = (M, K * data_map[A_in_dtype] // 16)
     B_shape = (N, K * data_map[B_in_dtype] // 16)
-    A_shared_shape = (block_M, block_K * data_map[A_in_dtype] // 16)
+    # To align with cp_async<16> instruction, we need to over allocate shared memory for A and B
+    Ak = T.max(block_K * data_map[A_in_dtype] // 16, block_row_warps * block_col_warps * 32 * 16 // (data_map[A_in_dtype] // 8))
+    A_shared_shape = (block_M, Ak)
     B_shared_shape = (block_N, block_K * data_map[B_in_dtype] // 16)
     # Use fake PTX instruction inner tile for safe staging to avoid OOB in stmatrix
     C_shared_shape = (
@@ -191,12 +193,12 @@ def tl_matmul(
             for ko in T.Pipelined((K // block_K), num_stages=stage):
 
                 # Load A into shared memory
-                for i, k in T.Parallel(block_M, block_K):
-                    A_shared[i, k] = A[by * block_M + i, ko * block_K + k]
+                for i, k in T.Parallel(block_M, Ak):
+                    A_shared[i, k] = A[by * block_M + i, ko * block_K * data_map[A_in_dtype] // 16 + k]
 
                 # Load B into shared memory
-                for j, k in T.Parallel(block_N, block_K):
-                    B_shared[j, k] = B[bx * block_N + j, ko * block_K + k]
+                for j, k in T.Parallel(block_N, block_K * data_map[B_in_dtype] // 16):
+                    B_shared[j, k] = B[bx * block_N + j, ko * block_K * data_map[A_in_dtype] // 16 + k]
 
                 for ki in T.serial(0, (block_K // micro_size_k)):
 
