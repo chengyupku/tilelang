@@ -31,10 +31,10 @@ class TensorCoreIntrinEmitter:
     To eliminate Python syntax within TIR Macro.
     """
 
-    M_DIM = 16
+    # M_dim = 1
     # use lowercase as n_dim can be dynamic
     # the smallest instructions can be m16n8k16, so the n_dim can also be 8
-    n_dim = 16
+    # n_dim = 64
     WARP_SIZE = 32
     dtype_abbrv = {
         "float16": "fp16",
@@ -65,6 +65,11 @@ class TensorCoreIntrinEmitter:
         num_elems_per_byte: int = 1,
         is_m_first: bool | None = False,
         thread_var: Var | None = None,
+        fake_instr_m: int | None = None,
+        fake_instr_n: int | None = None,
+        fake_instr_k: int | None = None,
+        fake_warp_rows: int | None = None,
+        fake_warp_cols: int | None = None,
     ):
         self.a_dtype = a_dtype
         self.b_dtype = b_dtype
@@ -77,10 +82,16 @@ class TensorCoreIntrinEmitter:
         self.warp_row_tiles = warp_row_tiles
         self.warp_col_tiles = warp_col_tiles
         self.chunk = chunk
+        self.M_dim = 16 if fake_instr_m is None else fake_instr_m
+        self.n_dim = 16 if fake_instr_n is None else fake_instr_n
+        # Record whether user provided a fake k dim explicitly
+        self._has_user_k_dim = fake_instr_k is not None
+        # Defer deciding k_dim until _initialize_k_dim, honoring user-provided value
+        self.k_dim = fake_instr_k if fake_instr_k is not None else None
         self._initialize_k_dim(a_dtype)
         self._initialize_abbrev(a_dtype, b_dtype, accum_dtype)
-        self._initialize_micro_size(self.M_DIM, self.k_dim)
-        self._initialize_local_size(self.M_DIM, self.n_dim, self.k_dim, self.WARP_SIZE)
+        self._initialize_micro_size(self.M_dim, self.k_dim)
+        self._initialize_local_size(self.M_dim, self.n_dim, self.k_dim, self.WARP_SIZE)
         self._initialize_mma_prefix(self.k_dim)
         self._initialize_is_m_first(is_m_first)
 
@@ -88,13 +99,21 @@ class TensorCoreIntrinEmitter:
         self.threads = self.WARP_SIZE * (block_row_warps * block_col_warps) * reduce_k
         self.num_elems_per_byte = num_elems_per_byte
         self.thread_var = thread_var
+        self.fake_warp_rows = fake_warp_rows
+        self.fake_warp_cols = fake_warp_cols
 
-        if self.warp_rows == 0 or self.warp_cols == 0:
+        # Validate effective warp tiling taking into account fake override hints
+        _eff_warp_rows = fake_warp_rows if fake_warp_rows is not None else self.warp_rows
+        _eff_warp_cols = fake_warp_cols if fake_warp_cols is not None else self.warp_cols
+        if _eff_warp_rows == 0 or _eff_warp_cols == 0:
             raise ValueError(
                 f"Invalid threads configuration for this tile shape, {self.warp_rows} x {self.warp_cols} with threads {self.threads}"
             )
 
     def _initialize_k_dim(self, a_dtype="float16"):
+        # If user explicitly provided k_dim (via fake_instr_k), honor it.
+        if self.k_dim is not None or self._has_user_k_dim:
+            return
         if isinstance(a_dtype, str):
             a_dtype = DataType(a_dtype)
         self.k_dim = 256 // a_dtype.bits
@@ -131,23 +150,26 @@ class TensorCoreIntrinEmitter:
     def _initialize_micro_size(self, m_dim: int = 16, k_dim: int = 16):
         warp_row_tiles = self.warp_row_tiles
         warp_col_tiles = self.warp_col_tiles
-        assert warp_row_tiles >= 16, f"warp_row_tiles must be greater than 16, got {warp_row_tiles}"
-        assert warp_row_tiles % 16 == 0, f"warp_row_tiles must be divisible by 16, got {warp_row_tiles}"
-        assert warp_col_tiles >= 8, f"warp_col_tiles must be greater than 8, got {warp_col_tiles}"
-        assert warp_col_tiles % 8 == 0, f"warp_col_tiles must be divisible by 8, got {warp_col_tiles}"
+        # assert warp_row_tiles >= 16, f"warp_row_tiles must be greater than 16, got {warp_row_tiles}"
+        # assert warp_row_tiles % 16 == 0, f"warp_row_tiles must be divisible by 16, got {warp_row_tiles}"
+        # assert warp_col_tiles >= 8, f"warp_col_tiles must be greater than 8, got {warp_col_tiles}"
+        # assert warp_col_tiles % 8 == 0, f"warp_col_tiles must be divisible by 8, got {warp_col_tiles}"
 
+        print(f"warp_row_tiles, {warp_row_tiles}, m_dim, {m_dim}")
         self.warp_rows = warp_row_tiles // m_dim
 
-        if warp_col_tiles % 16 == 0:
-            self.n_dim = 16
-            self.micro_size_y = 16
-            self.warp_cols = warp_col_tiles // 16
-        else:
-            # must be divisible by 8
-            self.n_dim = 8
-            self.micro_size_y = 8
-            self.warp_cols = warp_col_tiles // 8
+        # if warp_col_tiles % 16 == 0:
+        #     self.n_dim = 16
+        #     self.micro_size_y = 16
+        #     self.warp_cols = warp_col_tiles // 16
+        # else:
+        #     # must be divisible by 8
+        #     self.n_dim = 8
+        #     self.micro_size_y = 8
+        #     self.warp_cols = warp_col_tiles // 8
 
+        self.warp_cols = 1
+        self.micro_size_y = self.n_dim
         self.micro_size_x = m_dim
         self.micro_size_k = k_dim
 
@@ -209,7 +231,8 @@ class TensorCoreIntrinEmitter:
                    ki: PrimExpr,
                    rk: PrimExpr | None = 0):
         warp_row_tiles = self.warp_row_tiles
-        warp_rows = self.warp_rows
+        warp_rows = T.ceildiv(T.ceildiv(warp_row_tiles *
+                     self.chunk, self.WARP_SIZE), 8)  # load 8 fp16 when using ldmatrix_x4
         chunk = self.chunk
         micro_size_x = self.micro_size_x
         micro_size_k = self.micro_size_k
@@ -231,6 +254,8 @@ class TensorCoreIntrinEmitter:
                 raise ValueError(f"Unsupported dtype: {a_dtype}")
 
         thread_binding = self.get_thread_binding()
+        
+        print(f"ldmatrix warp_rows: {warp_rows}")
 
         @T.macro
         def _warp_ldmatrix_a(
@@ -339,13 +364,17 @@ class TensorCoreIntrinEmitter:
 
         return _warp_ldmatrix_b(B_local_buf, B_shared_buf, ki, thread_binding, rk)
 
-    def mma(self,
-            A_local_buf: Buffer,
-            B_local_buf: Buffer,
-            C_local_buf: Buffer,
-            k_inner: PrimExpr | None = 0):
-        warp_rows = self.warp_rows
-        warp_cols = self.warp_cols
+    def mma(
+        self,
+        A_local_buf: Buffer,
+        B_local_buf: Buffer,
+        C_local_buf: Buffer,
+        k_inner: PrimExpr | None = 0,
+        # If True, simulate the MMA with CIM mode using A as a proxy for B
+        cim_simulate: bool = False):
+        # Effective warp tiles (allow override via fake_warp_* for CIM sim)
+        warp_rows = self.warp_rows if self.fake_warp_rows is None else self.fake_warp_rows
+        warp_cols = self.warp_cols if self.fake_warp_cols is None else self.fake_warp_cols
         local_size_a = self.local_size_a
         local_size_b = self.local_size_b
         local_size_out = self.local_size_out
@@ -379,6 +408,8 @@ class TensorCoreIntrinEmitter:
                     C_local_buf.data,
                     i * warp_cols * local_size_out + j * local_size_out,
                     T.bool(False),  # saturate
+                    None,
+                    cim_simulate,
                 )
                 if replicate_b:
                     T.ptx_mma(
@@ -397,6 +428,8 @@ class TensorCoreIntrinEmitter:
                         i * warp_cols * local_size_out + j * local_size_out +
                         lift(local_size_out) // 2,
                         T.bool(False),  # saturate
+                        None,
+                        cim_simulate,
                     )
 
         return _warp_mma(A_local_buf, B_local_buf, C_local_buf)
@@ -404,14 +437,15 @@ class TensorCoreIntrinEmitter:
     def stmatrix(self, C_local_buf, C_buf, pid_m=None, pid_n=None):
         block_row_warps = self.block_row_warps
         block_col_warps = self.block_col_warps
-        warp_rows = self.warp_rows
-        warp_cols = self.warp_cols
+        # Respect fake warp override for CIM simulation or custom tiling
+        warp_rows = self.warp_rows if self.fake_warp_rows is None else self.fake_warp_rows
+        warp_cols = self.warp_cols if self.fake_warp_cols is None else self.fake_warp_cols
         local_size_out = self.local_size_out
 
         is_global = pid_m is not None and pid_n is not None
         BLOCK_M = block_row_warps * warp_rows
         BLOCK_N = block_col_warps * warp_cols
-        M_DIM, n_dim = self.M_DIM, self.n_dim
+        M_dim, n_dim = self.M_dim, self.n_dim
         C_buf_dims = len(C_buf.shape)
         assert C_buf_dims in {2, 4}, "C_buf should be 2D or 4D"
 
@@ -430,7 +464,7 @@ class TensorCoreIntrinEmitter:
                         local_id = local_id_o * 2 + local_id_i
                         row, col = T.meta_var(mma_store_index_map(tx, local_id))
                         if C_buf_dims == 2:
-                            C_buf[(warp_m * warp_rows + i) * M_DIM + row,
+                            C_buf[(warp_m * warp_rows + i) * M_dim + row,
                                   (warp_n * warp_cols + j) * n_dim +
                                   col] = C_local_buf[i * (warp_cols * local_size_out) +
                                                      j * local_size_out + local_id]
@@ -448,7 +482,7 @@ class TensorCoreIntrinEmitter:
                         local_id = local_id_o * 2 + local_id_i
                         row, col = T.meta_var(mma_store_index_map(tx, local_id))
                         C_buf[
-                            (pid_m * BLOCK_M + warp_m * warp_rows + i) * M_DIM + row,
+                            (pid_m * BLOCK_M + warp_m * warp_rows + i) * M_dim + row,
                             (pid_n * BLOCK_N + warp_n * warp_cols + j) * n_dim + col,
                         ] = C_local_buf[i * warp_cols * local_size_out + j * local_size_out +
                                         local_id]
