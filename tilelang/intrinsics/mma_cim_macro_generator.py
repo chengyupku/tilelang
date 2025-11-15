@@ -393,7 +393,8 @@ class TensorCoreIntrinEmitter:
 
         @T.macro
         def _warp_mma(A_local_buf, B_local_buf, C_local_buf):
-            for i, j in T.grid(warp_rows, warp_cols):
+            # for i, j in T.grid(warp_rows, warp_cols):
+            for j, i in T.grid(warp_cols, warp_rows):
                 T.ptx_mma(
                     accum_dtype,
                     mma_prefix,
