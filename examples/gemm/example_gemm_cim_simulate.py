@@ -190,6 +190,7 @@ def tl_matmul(
 
             # Improve L2 Cache
             T.use_swizzle(panel_size=10)
+            warp_idx = T.get_thread_binding(0) // warp_size % block_col_warps
 
             T.clear(C_local)
 
@@ -214,7 +215,7 @@ def tl_matmul(
                         mma_emitter.ldmatrix_b(B_local, B_shared, ki)
 
                     # Perform Matrix Multiplication
-                    mma_emitter.mma(A_local, B_shared, C_local, cim_simulate=True)
+                    mma_emitter.mma(A_local, B_shared, C_local, cim_simulate=True, offset=(block_N // block_col_warps * warp_idx) * (block_K * data_map[B_in_dtype] // 16))
 
             if use_shmem_writeback:
                 # Perform STMatrix
@@ -344,8 +345,8 @@ if __name__ == "__main__":
     parser.add_argument("--M", type=int, default=8192)
     parser.add_argument("--N", type=int, default=8192)
     parser.add_argument("--K", type=int, default=8192)
-    parser.add_argument("--micro_m", type=int, default=4)
-    parser.add_argument("--micro_n", type=int, default=32)
+    parser.add_argument("--micro_m", type=int, default=16)
+    parser.add_argument("--micro_n", type=int, default=8)
     parser.add_argument("--micro_k", type=int, default=32)
     parser.add_argument("--fake_instr_m", type=int, default=16)
     parser.add_argument("--fake_instr_n", type=int, default=8)

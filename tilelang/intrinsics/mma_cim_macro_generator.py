@@ -372,7 +372,9 @@ class TensorCoreIntrinEmitter:
         C_local_buf: Buffer,
         k_inner: PrimExpr | None = 0,
         # If True, simulate the MMA with CIM mode using A as a proxy for B
-        cim_simulate: bool = False):
+        cim_simulate: bool = False,
+        offset: PrimExpr | None = 0,
+        ):
         # Effective warp tiles (allow override via fake_warp_* for CIM sim)
         warp_rows = self.warp_rows if self.fake_warp_rows is None else self.fake_warp_rows
         warp_cols = self.warp_cols if self.fake_warp_cols is None else self.fake_warp_cols
@@ -405,7 +407,9 @@ class TensorCoreIntrinEmitter:
                     accum_dtype_abbrv,
                     A_local_buf.data,
                     a_local_stride + i * local_size_a,
-                    B_local_buf.data,
+                    B_local_buf.access_ptr(1, offset=offset),
+                    # T.tvm_access_ptr(T.type_annotation("float16"), B_local_buf.data, offset, B_local_buf., 3),
+                    # B_local_buf.data,
                     b_local_stride + j * local_size_b,
                     C_local_buf.data,
                     i * warp_cols * local_size_out + j * local_size_out,
