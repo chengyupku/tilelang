@@ -40,18 +40,27 @@ call_fma_impl(typename MmaImplTraits<Impl>::DReg *d,
   Impl::fma(d[DIdx]..., a[AIdx]..., b[BIdx]..., c[CIdx]...);
 }
 
-template <class Impl, size_t... DIdx, size_t... AIdx, size_t... BIdx,
-          size_t... CIdx>
+template <class Impl, size_t... DIdx, size_t... AIdx, size_t... BIdx, size_t... CIdx>
 TL_DEVICE void call_fma_cim_simulation_impl(
     typename MmaImplTraits<Impl>::DReg *d,
     const typename MmaImplTraits<Impl>::AReg *a,
     const typename MmaImplTraits<Impl>::BReg *b,
-    const typename MmaImplTraits<Impl>::CReg *c, std::index_sequence<DIdx...>,
-    std::index_sequence<AIdx...>, std::index_sequence<BIdx...>,
+    const typename MmaImplTraits<Impl>::CReg *c,
+    std::index_sequence<DIdx...>,
+    std::index_sequence<AIdx...>,
+    std::index_sequence<BIdx...>,
     std::index_sequence<CIdx...>) {
-  using BReg = typename MmaImplTraits<Impl>::BReg;
-  (void)b; // unused in CIM simulation path
-  Impl::fma(d[DIdx]..., a[AIdx]..., static_cast<BReg>(a[BIdx])..., c[CIdx]...);
+
+    using BReg = typename MmaImplTraits<Impl>::BReg;
+
+    const auto b0_addr = reinterpret_cast<std::uintptr_t>(&b[0]);
+
+    Impl::fma(
+        d[DIdx]...,
+        a[AIdx]...,
+        ((void)BIdx, static_cast<BReg>(b0_addr))...,
+        c[CIdx]...
+    );
 }
 
 template <class Impl>

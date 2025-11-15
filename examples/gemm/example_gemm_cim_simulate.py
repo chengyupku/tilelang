@@ -303,8 +303,8 @@ def main(M=4096,
 
     A_shape = (M, K * data_map[A_in_dtype] // 16)
     B_shape = (N, K * data_map[B_in_dtype] // 16)
-    a = torch.zeros(A_shape, dtype=torch.float16).cuda()
-    b = torch.zeros(B_shape, dtype=torch.float16).cuda()
+    a = torch.randn(A_shape, dtype=torch.float16).cuda()
+    b = torch.randn(B_shape, dtype=torch.float16).cuda()
     latency = benchmark_cuda(lambda: kernel(a, b), warmup=20, repeat=200)
 
     print(f"CIM latency:{latency} ms")

@@ -32,7 +32,7 @@ def main(
     stage,
     tracekernel,
     use_shmem_writeback,
-    use_zero_benchmark=True
+    use_zero_benchmark=False
 ):
     kernel = tl_matmul(
         M,
