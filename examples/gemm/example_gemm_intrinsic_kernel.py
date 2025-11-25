@@ -113,8 +113,10 @@ def tl_matmul(
             A_shared = T.alloc_shared(A_shared_shape, A_in_dtype, scope=shared_scope)
             B_shared = T.alloc_shared(B_shared_shape, B_in_dtype, scope=shared_scope)
             C_shared = T.alloc_shared(C_shared_shape, C_out_dtype, scope=shared_scope)
-            A_local = T.alloc_local((warp_rows * local_size_a), A_in_dtype)
-            B_local = T.alloc_local((warp_cols * local_size_b), B_in_dtype)
+            A_local_0 = T.alloc_local((warp_rows * local_size_a), A_in_dtype)
+            A_local_1 = T.alloc_local((warp_rows * local_size_a), A_in_dtype)
+            B_local_0 = T.alloc_local((warp_cols * local_size_b), B_in_dtype)
+            B_local_1 = T.alloc_local((warp_cols * local_size_b), B_in_dtype)
             C_local = T.alloc_local((warp_rows * warp_cols * local_size_c), C_in_dtype)
 
             T.annotate_layout({
@@ -137,16 +139,26 @@ def tl_matmul(
                 for j, k in T.Parallel(block_N, block_K):
                     B_shared[j, k] = B[bx * block_N + j, ko * block_K + k]
 
-                for ki in T.serial(0, (block_K // micro_size_k)):
+                # Load A into fragment
+                mma_emitter.ldmatrix_a(A_local_0, A_shared, 0)
 
-                    # Load A into fragment
-                    mma_emitter.ldmatrix_a(A_local, A_shared, ki)
-
-                    # Load B into fragment
-                    mma_emitter.ldmatrix_b(B_local, B_shared, ki)
-
-                    # Perform Matrix Multiplication
-                    mma_emitter.mma(A_local, B_local, C_local)
+                # Load B into fragment
+                mma_emitter.ldmatrix_b(B_local_0, B_shared, 0)                
+                
+                for ki in T.serial(0, ((block_K // micro_size_k) - 1) // 2):
+                    mma_emitter.mma(A_local_0, B_local_0, C_local)
+                    mma_emitter.ldmatrix_a(A_local_1, A_shared, ki * 2 + 1)
+                    mma_emitter.ldmatrix_b(B_local_1, B_shared, ki * 2 + 1)
+                    mma_emitter.mma(A_local_1, B_local_1, C_local)
+                    mma_emitter.ldmatrix_a(A_local_0, A_shared, ki * 2 + 2)
+                    mma_emitter.ldmatrix_b(B_local_0, B_shared, ki * 2 + 2)
+                    
+                mma_emitter.mma(A_local_0, B_local_0, C_local)
+                if (block_K // micro_size_k) % 2 == 0:
+                    k_last = (block_K // micro_size_k) - 1
+                    mma_emitter.ldmatrix_a(A_local_1, A_shared, k_last)
+                    mma_emitter.ldmatrix_b(B_local_1, B_shared, k_last)
+                    mma_emitter.mma(A_local_1, B_local_1, C_local)
 
             if use_shmem_writeback:
                 # Perform STMatrix
