@@ -9,6 +9,24 @@ from tilelang.transform import simplify_prim_func
 from tilelang.profiler import do_bench
 import torch
 from typing import Callable
+from tilelang.engine.callback import register_cuda_postproc_callback
+
+def _strip_redundant_syncthreads(code: str) -> str:
+    lines = code.splitlines(keepends=True)
+    kept = []
+    for idx, line in enumerate(lines):
+        if "__syncthreads();" in line:
+            prev_line = lines[idx - 1] if idx > 0 else ""
+            if "cp_async_wait" not in prev_line:
+                continue
+        kept.append(line)
+    return "".join(kept)
+
+@register_cuda_postproc_callback
+def tilelang_callback_cuda_postproc(code, _):
+    print(f"[tilelang postproc] raw CUDA len={len(code)}, head={repr(code[:200])}")
+    processed_code = _strip_redundant_syncthreads(code)
+    return processed_code
 
 tilelang.disable_cache()
 
@@ -342,9 +360,9 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--M", type=int, default=8192)
-    parser.add_argument("--N", type=int, default=8192)
-    parser.add_argument("--K", type=int, default=8192)
+    parser.add_argument("--M", type=int, default=1024)
+    parser.add_argument("--N", type=int, default=1024)
+    parser.add_argument("--K", type=int, default=2048)
     parser.add_argument("--micro_m", type=int, default=16)
     parser.add_argument("--micro_n", type=int, default=8)
     parser.add_argument("--micro_k", type=int, default=32)
@@ -355,7 +373,7 @@ if __name__ == "__main__":
     parser.add_argument("--warp_n", type=int, default=64)
     parser.add_argument("--chunk", type=int, default=64)
     parser.add_argument("--block_m", type=int, default=128)
-    parser.add_argument("--block_n", type=int, default=128)
+    parser.add_argument("--block_n", type=int, default=256)
     parser.add_argument("--Atype", type=str, default="int8")
     parser.add_argument("--Wtype", type=str, default="int8")
     parser.add_argument("--Outtype", type=str, default="float32")

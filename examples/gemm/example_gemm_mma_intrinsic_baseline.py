@@ -6,6 +6,8 @@ from example_gemm_intrinsic_kernel import tl_matmul
 
 import os
 
+tilelang.disable_cache()
+
 def str_to_bool(value):
     if isinstance(value, bool):
         return value
@@ -111,41 +113,41 @@ def main(
     total_flops = 2 * M * N * K
     print(f"tilelang TFlops (or Tops): {total_flops / latency * 1e-9} TFlops")
 
-    # # benchmark torch
-    # def torch_bench(func, *args, **kwargs):
-    #     # warmup
-    #     for _ in range(10):
-    #         func(*args, **kwargs)
-    #     torch.cuda.synchronize()
-    #     # bench
-    #     start = torch.cuda.Event(enable_timing=True)
-    #     end = torch.cuda.Event(enable_timing=True)
-    #     start.record()
-    #     for _ in range(100):
-    #         func(*args, **kwargs)
-    #     end.record()
-    #     torch.cuda.synchronize()
-    #     return start.elapsed_time(end) / 100
-    # if in_dtype == torch.int8:
-    #     latency = torch_bench(torch._int_mm, A, B.T)
-    # else:
-    #     latency = torch_bench(torch.matmul, A, B.T)
-    # print(f"torch Latency: {latency}ms")
-    # print(f"torch TFlops (or Tops): {total_flops / latency * 1e-9} TFlops")
+    # benchmark torch
+    def torch_bench(func, *args, **kwargs):
+        # warmup
+        for _ in range(10):
+            func(*args, **kwargs)
+        torch.cuda.synchronize()
+        # bench
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        for _ in range(100):
+            func(*args, **kwargs)
+        end.record()
+        torch.cuda.synchronize()
+        return start.elapsed_time(end) / 100
+    if A_in_dtype == torch.int8:
+        latency = torch_bench(torch._int_mm, A, B.T)
+    else:
+        latency = torch_bench(torch.matmul, A, B.T)
+    print(f"torch Latency: {latency}ms")
+    print(f"torch TFlops (or Tops): {total_flops / latency * 1e-9} TFlops")
 
 
 if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--M", type=int, default=8192)
-    parser.add_argument("--N", type=int, default=8192)
-    parser.add_argument("--K", type=int, default=8192)
+    parser.add_argument("--M", type=int, default=1024)
+    parser.add_argument("--N", type=int, default=1024)
+    parser.add_argument("--K", type=int, default=2048)
     parser.add_argument("--warp_m", type=int, default=64)
     parser.add_argument("--warp_n", type=int, default=64)
     parser.add_argument("--chunk", type=int, default=64)
     parser.add_argument("--block_m", type=int, default=128)
-    parser.add_argument("--block_n", type=int, default=128)
+    parser.add_argument("--block_n", type=int, default=256)
     parser.add_argument("--Atype", type=str, default="int8")
     parser.add_argument("--Wtype", type=str, default="int8")
     parser.add_argument("--Outtype", type=str, default="int32")

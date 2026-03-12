@@ -1,3 +1,4 @@
+import os
 from tilelang import tvm as tvm
 from tvm import DataType
 import tilelang
@@ -6,6 +7,67 @@ from tilelang.intrinsics import get_swizzle_layout
 from tilelang.intrinsics.mma_macro_generator import (
     TensorCoreIntrinEmitter,)
 from tilelang.transform import simplify_prim_func
+from tilelang.engine.callback import register_cuda_postproc_callback
+
+TILELANG_KERNELS_OUT = os.environ.get("TILELANG_KERNELS_OUT")
+TILELANG_CUDA_ARCH = os.environ.get("TILELANG_CUDA_ARCH", "80")
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+TL_TEMPLATE_PATH = os.environ.get("TL_TEMPLATE_PATH", os.path.join(PROJECT_ROOT, "src"))
+TL_CUTLASS_PATH = os.environ.get("TL_CUTLASS_PATH", os.path.join(PROJECT_ROOT, "3rdparty/cutlass/include"))
+
+
+def _strip_redundant_syncthreads(code: str) -> str:
+    lines = code.splitlines(keepends=True)
+    kept = []
+    for idx, line in enumerate(lines):
+        if "__syncthreads();" in line:
+            prev_line = lines[idx - 1] if idx > 0 else ""
+            if "cp_async_wait" not in prev_line:
+                continue
+        kept.append(line)
+    return "".join(kept)
+
+
+@register_cuda_postproc_callback
+def tilelang_callback_cuda_postproc(code, _):
+    print(f"[tilelang postproc] raw CUDA len={len(code)}, head={repr(code[:200])}")
+    processed_code = _strip_redundant_syncthreads(code)
+
+    if TILELANG_KERNELS_OUT:
+        from tilelang.contrib import nvcc
+
+        os.makedirs(TILELANG_KERNELS_OUT, exist_ok=True)
+        dump_path = os.path.join(
+            TILELANG_KERNELS_OUT,
+            f"postproc_{os.getpid()}_sm{TILELANG_CUDA_ARCH}.cu",
+        )
+        cubin_path = os.path.join(
+            TILELANG_KERNELS_OUT,
+            f"postproc_{os.getpid()}_sm{TILELANG_CUDA_ARCH}.cubin",
+        )
+        try:
+            with open(dump_path, "w") as f:
+                f.write(processed_code)
+            arch_flag = [f"-arch=sm_{TILELANG_CUDA_ARCH}"]
+            nvcc.compile_cuda(
+                processed_code,
+                target_format="cubin",
+                arch=arch_flag,
+                options=[
+                    "-std=c++17",
+                    "--use_fast_math",
+                    "-I" + TL_TEMPLATE_PATH,
+                    "-I" + TL_CUTLASS_PATH,
+                ],
+                path_target=cubin_path,
+                verbose=True,
+            )
+            print(f"[tilelang postproc] CUDA source -> {dump_path}, cubin -> {cubin_path}")
+        except Exception as e:
+            print(f"[tilelang postproc] Failed to dump CUDA source: {e}")
+    return processed_code
+
+tilelang.disable_cache()
 
 
 def make_swizzle_layout(shared_buf):
@@ -113,10 +175,12 @@ def tl_matmul(
             A_shared = T.alloc_shared(A_shared_shape, A_in_dtype, scope=shared_scope)
             B_shared = T.alloc_shared(B_shared_shape, B_in_dtype, scope=shared_scope)
             C_shared = T.alloc_shared(C_shared_shape, C_out_dtype, scope=shared_scope)
-            A_local_0 = T.alloc_local((warp_rows * local_size_a), A_in_dtype)
-            A_local_1 = T.alloc_local((warp_rows * local_size_a), A_in_dtype)
-            B_local_0 = T.alloc_local((warp_cols * local_size_b), B_in_dtype)
-            B_local_1 = T.alloc_local((warp_cols * local_size_b), B_in_dtype)
+            # A_local_0 = T.alloc_local((warp_rows * local_size_a), A_in_dtype)
+            # A_local_1 = T.alloc_local((warp_rows * local_size_a), A_in_dtype)
+            # B_local_0 = T.alloc_local((warp_cols * local_size_b), B_in_dtype)
+            # B_local_1 = T.alloc_local((warp_cols * local_size_b), B_in_dtype)
+            A_local = T.alloc_local((warp_rows * local_size_a), A_in_dtype)
+            B_local = T.alloc_local((warp_cols * local_size_b), B_in_dtype)
             C_local = T.alloc_local((warp_rows * warp_cols * local_size_c), C_in_dtype)
 
             T.annotate_layout({
@@ -139,26 +203,37 @@ def tl_matmul(
                 for j, k in T.Parallel(block_N, block_K):
                     B_shared[j, k] = B[bx * block_N + j, ko * block_K + k]
 
-                # Load A into fragment
-                mma_emitter.ldmatrix_a(A_local_0, A_shared, 0)
+                # # Load A into fragment
+                # mma_emitter.ldmatrix_a(A_local_0, A_shared, 0)
 
-                # Load B into fragment
-                mma_emitter.ldmatrix_b(B_local_0, B_shared, 0)                
+                # # Load B into fragment
+                # mma_emitter.ldmatrix_b(B_local_0, B_shared, 0)                
                 
-                for ki in T.serial(0, ((block_K // micro_size_k) - 1) // 2):
-                    mma_emitter.mma(A_local_0, B_local_0, C_local)
-                    mma_emitter.ldmatrix_a(A_local_1, A_shared, ki * 2 + 1)
-                    mma_emitter.ldmatrix_b(B_local_1, B_shared, ki * 2 + 1)
-                    mma_emitter.mma(A_local_1, B_local_1, C_local)
-                    mma_emitter.ldmatrix_a(A_local_0, A_shared, ki * 2 + 2)
-                    mma_emitter.ldmatrix_b(B_local_0, B_shared, ki * 2 + 2)
+                # for ki in T.serial(0, ((block_K // micro_size_k) - 1) // 2):
+                #     mma_emitter.mma(A_local_0, B_local_0, C_local)
+                #     mma_emitter.ldmatrix_a(A_local_1, A_shared, ki * 2 + 1)
+                #     mma_emitter.ldmatrix_b(B_local_1, B_shared, ki * 2 + 1)
+                #     mma_emitter.mma(A_local_1, B_local_1, C_local)
+                #     mma_emitter.ldmatrix_a(A_local_0, A_shared, ki * 2 + 2)
+                #     mma_emitter.ldmatrix_b(B_local_0, B_shared, ki * 2 + 2)
                     
-                mma_emitter.mma(A_local_0, B_local_0, C_local)
-                if (block_K // micro_size_k) % 2 == 0:
-                    k_last = (block_K // micro_size_k) - 1
-                    mma_emitter.ldmatrix_a(A_local_1, A_shared, k_last)
-                    mma_emitter.ldmatrix_b(B_local_1, B_shared, k_last)
-                    mma_emitter.mma(A_local_1, B_local_1, C_local)
+                # mma_emitter.mma(A_local_0, B_local_0, C_local)
+                # if (block_K // micro_size_k) % 2 == 0:
+                #     k_last = (block_K // micro_size_k) - 1
+                #     mma_emitter.ldmatrix_a(A_local_1, A_shared, k_last)
+                #     mma_emitter.ldmatrix_b(B_local_1, B_shared, k_last)
+                #     mma_emitter.mma(A_local_1, B_local_1, C_local)
+
+                for ki in T.serial(0, (block_K // micro_size_k)):
+
+                    # Load A into fragment
+                    mma_emitter.ldmatrix_a(A_local, A_shared, ki)
+
+                    # Load B into fragment
+                    mma_emitter.ldmatrix_b(B_local, B_shared, ki)
+
+                    # Perform Matrix Multiplication
+                    mma_emitter.mma(A_local, B_local, C_local)
 
             if use_shmem_writeback:
                 # Perform STMatrix
