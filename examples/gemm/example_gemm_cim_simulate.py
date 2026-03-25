@@ -59,22 +59,25 @@ data_map = {
     "int4": 4,
 }
 
-def benchmark_cuda(func: Callable[[], None], warmup: int = 10, repeat: int = 100) -> float:
+def benchmark_cuda(func: Callable[[], None], warmup: int = 20, repeat: int = 200) -> float:
+    """Benchmark a callable via torch.profiler (CUPTI backend)."""
     import torch
 
     for _ in range(warmup):
         func()
     torch.cuda.synchronize()
 
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    start.record()
-    for _ in range(repeat):
-        func()
-    end.record()
-    torch.cuda.synchronize()
-    latency_ms = start.elapsed_time(end) / repeat
-    return latency_ms
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CUDA],
+        record_shapes=False,
+        profile_memory=False,
+    ) as prof:
+        for _ in range(repeat):
+            func()
+        torch.cuda.synchronize()
+
+    cuda_us = sum(e.self_device_time_total for e in prof.key_averages())
+    return cuda_us / repeat / 1000  # us -> ms
 
 @tilelang.jit(
     out_idx=[2],

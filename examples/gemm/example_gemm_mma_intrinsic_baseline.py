@@ -113,25 +113,27 @@ def main(
     total_flops = 2 * M * N * K
     print(f"tilelang TFlops (or Tops): {total_flops / latency * 1e-9} TFlops")
 
-    # benchmark torch
-    def torch_bench(func, *args, **kwargs):
-        # warmup
-        for _ in range(10):
-            func(*args, **kwargs)
+    # benchmark torch (CUPTI via torch.profiler)
+    def cupti_bench_torch(func, n_warmup=20, n_repeat=200):
+        for _ in range(n_warmup):
+            func()
         torch.cuda.synchronize()
-        # bench
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record()
-        for _ in range(100):
-            func(*args, **kwargs)
-        end.record()
-        torch.cuda.synchronize()
-        return start.elapsed_time(end) / 100
+        with torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CUDA],
+            record_shapes=False,
+            profile_memory=False,
+        ) as prof:
+            for _ in range(n_repeat):
+                func()
+            torch.cuda.synchronize()
+        cuda_us = sum(e.self_device_time_total for e in prof.key_averages())
+        return cuda_us / n_repeat / 1000  # us -> ms
+
+    B_T = B.T
     if A_in_dtype == torch.int8:
-        latency = torch_bench(torch._int_mm, A, B.T)
+        latency = cupti_bench_torch(lambda: torch._int_mm(A, B_T))
     else:
-        latency = torch_bench(torch.matmul, A, B.T)
+        latency = cupti_bench_torch(lambda: torch.matmul(A, B_T))
     print(f"torch Latency: {latency}ms")
     print(f"torch TFlops (or Tops): {total_flops / latency * 1e-9} TFlops")
 
