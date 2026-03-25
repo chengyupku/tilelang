@@ -22,11 +22,11 @@ def _strip_redundant_syncthreads(code: str) -> str:
         kept.append(line)
     return "".join(kept)
 
-@register_cuda_postproc_callback
-def tilelang_callback_cuda_postproc(code, _):
-    print(f"[tilelang postproc] raw CUDA len={len(code)}, head={repr(code[:200])}")
-    processed_code = _strip_redundant_syncthreads(code)
-    return processed_code
+# @register_cuda_postproc_callback
+# def tilelang_callback_cuda_postproc(code, _):
+#     print(f"[tilelang postproc] raw CUDA len={len(code)}, head={repr(code[:200])}")
+#     processed_code = _strip_redundant_syncthreads(code)
+#     return processed_code
 
 tilelang.disable_cache()
 

@@ -31,7 +31,7 @@ def _strip_redundant_syncthreads(code: str) -> str:
 @register_cuda_postproc_callback
 def tilelang_callback_cuda_postproc(code, _):
     print(f"[tilelang postproc] raw CUDA len={len(code)}, head={repr(code[:200])}")
-    processed_code = _strip_redundant_syncthreads(code)
+    # processed_code = _strip_redundant_syncthreads(code)
 
     if TILELANG_KERNELS_OUT:
         from tilelang.contrib import nvcc
