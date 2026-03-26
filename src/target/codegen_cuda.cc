@@ -2065,7 +2065,7 @@ void CodeGenTileLangCUDA::VisitExpr_(const CallNode *op, std::ostream &os) {
     // arg 11: C accumulator index
     // arg 12: saturate
     // arg 13: (optional) 1-bit operator (xor or and)
-    ICHECK(op->args.size() == 13U || op->args.size() == 14U);
+    ICHECK(op->args.size() >= 13U && op->args.size() <= 15U);
     std::string shape = Downcast<StringImm>(op->args[0])->value;
     std::string A_layout = Downcast<StringImm>(op->args[1])->value;
     std::string B_layout = Downcast<StringImm>(op->args[2])->value;
@@ -2083,13 +2083,36 @@ void CodeGenTileLangCUDA::VisitExpr_(const CallNode *op, std::ostream &os) {
     auto dtype_c_enum = tl::codegen::ptx::DTypeFromString(C_dtype);
     auto [m, n, k] = tl::codegen::ptx::ParseMMAShape(shape);
 
+    // Optional CimSimulate flag (appended after the standard 13-14 args).
+    bool cim_flag = false;
+    if (op->args.size() == 15U) {
+      if (const auto *imm = op->args[14].as<IntImmNode>()) {
+        cim_flag = (imm->value != 0);
+      }
+    } else if (op->args.size() == 14U) {
+      if (op->args[13].as<StringImmNode>() == nullptr) {
+        if (const auto *imm = op->args[13].as<IntImmNode>()) {
+          cim_flag = (imm->value != 0);
+        }
+      }
+    }
+
     need_mma_instruction_h_ = true;
     this->PrintIndent();
+    // Only emit extra template params when CIM simulation is active;
+    // otherwise keep the upstream template signature unchanged.
     std::string mma_call =
-        "tl::mma_sync<(AType), (BType), (CType), (M), (N), (K), (TransA), "
-        "(TransB)>(reinterpret_cast<(CRegType)*>((C_ptr) + (C_offset)), "
-        "reinterpret_cast<const (ARegType)*>((A_ptr) + (A_offset)), "
-        "reinterpret_cast<const (BRegType)*>((B_ptr) + (B_offset)));\n";
+        cim_flag
+            ? "tl::mma_sync<(AType), (BType), (CType), (M), (N), (K), "
+              "(TransA), (TransB), false, true>("
+              "reinterpret_cast<(CRegType)*>((C_ptr) + (C_offset)), "
+              "reinterpret_cast<const (ARegType)*>((A_ptr) + (A_offset)), "
+              "reinterpret_cast<const (BRegType)*>((B_ptr) + (B_offset)));\n"
+            : "tl::mma_sync<(AType), (BType), (CType), (M), (N), (K), "
+              "(TransA), (TransB)>("
+              "reinterpret_cast<(CRegType)*>((C_ptr) + (C_offset)), "
+              "reinterpret_cast<const (ARegType)*>((A_ptr) + (A_offset)), "
+              "reinterpret_cast<const (BRegType)*>((B_ptr) + (B_offset)));\n";
     tl::codegen::Replacer replacer;
 
     // TODO(lei): Type Workaround for TF32, should be removed when
