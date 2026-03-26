@@ -67,6 +67,7 @@ def flashattn_cim(
     block_row_warps,
     block_col_warps,
     stage=2,
+    ldb=False,
 ):
     dtype = "float16"
     accum_dtype = "float32"
@@ -205,6 +206,8 @@ def flashattn_cim(
                 T.clear(acc_s)
                 for ki in T.serial(chunk_0 // micro_size_k):
                     mma0.ldmatrix_a(A_local_0, Q_shared, ki)
+                    if ldb and ki == 0 and ko == 0:
+                        mma0.ldmatrix_b(B_local, K_shared, ki)
                     mma0.mma(
                         A_local_0, K_shared, acc_s,
                         cim_simulate=True,
@@ -289,6 +292,7 @@ def main(
     block_row_warps=4,
     block_col_warps=2,
     stage=1,
+    ldb=False,
 ):
     flops_per_matmul = 2.0 * batch * heads * seq_len * seq_len * dim
     total_flops = 2 * flops_per_matmul
@@ -302,6 +306,7 @@ def main(
         block_M, block_N,
         block_row_warps, block_col_warps,
         stage=stage,
+        ldb=ldb,
     )
 
     # print(kernel.get_kernel_source())
@@ -346,6 +351,8 @@ if __name__ == "__main__":
     parser.add_argument("--block_row_warps", type=int, default=4)
     parser.add_argument("--block_col_warps", type=int, default=2)
     parser.add_argument("--stage", type=int, default=1)
+    parser.add_argument("--ldb", type=str_to_bool, nargs='?',
+                        const=True, default=False)
 
     args = parser.parse_args()
 
@@ -366,4 +373,5 @@ if __name__ == "__main__":
         block_row_warps=args.block_row_warps,
         block_col_warps=args.block_col_warps,
         stage=args.stage,
+        ldb=args.ldb,
     )
