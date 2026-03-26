@@ -202,7 +202,8 @@ def tl_matmul(
 
             T.annotate_layout({
                 A_shared: make_swizzle_layout(A_shared),
-                B_shared: make_swizzle_layout(B_shared),
+                # no need to calculate swizzle for B in CIM
+                # B_shared: make_swizzle_layout(B_shared),
             })
 
             # Improve L2 Cache
@@ -260,7 +261,7 @@ def tl_matmul(
     return gemm_intrinsics
 
 def ref_program_fp(A, B):
-    return A @ B
+    return torch.matmul(A, B)
 def ref_program_int(A, B):
     return torch._int_mm(A, B)
 
@@ -325,20 +326,29 @@ def main(M=4096,
     b = torch.randn(B_shape, dtype=torch.float16).cuda()
     latency = benchmark_cuda(lambda: kernel(a, b), warmup=20, repeat=200)
 
-    print(f"CIM latency:{latency} ms")
+    print(f"CIM latency: {latency} ms")
     print(f"CIM TFLOPS: {tflops / (latency / 1e3)}")
     
-    # if A_in_dtype == "float16":
-    #     a = torch.randn((M, K), dtype=torch.float16).cuda()
-    #     b = torch.randn((K, N), dtype=torch.float16).cuda()
-    #     torch_latency = benchmark_cuda(lambda: ref_program_fp(a, b))
-    # else:
-    #     a = torch.randint(-128, 127, (M, K), dtype=torch.int8).cuda()
-    #     b = torch.randint(-128, 127, (N, K), dtype=torch.int8).cuda()
-    #     torch_latency = benchmark_cuda(lambda: ref_program_int(a, b))
-    
-    # print(f"torch latency:{torch_latency} ms")
-    # print(f"torch TFLOPS: {tflops / (torch_latency / 1e3)}")
+    torch_latency = None
+    if A_in_dtype == "float16" and B_in_dtype == "float16":
+        a = torch.randn((M, K), dtype=torch.float16).cuda()
+        b = torch.randn((N, K), dtype=torch.float16).cuda()
+        b_t = b.T
+        torch_latency = benchmark_cuda(lambda: ref_program_fp(a, b_t))
+    elif A_in_dtype == "int8" and B_in_dtype == "int8":
+        a = torch.randint(-128, 128, (M, K), dtype=torch.int8).cuda()
+        b = torch.randint(-128, 128, (N, K), dtype=torch.int8).cuda()
+        b_t = b.T
+        torch_latency = benchmark_cuda(lambda: ref_program_int(a, b_t))
+    else:
+        print(
+            f"Skip torch benchmark: no PyTorch/cuBLAS reference for "
+            f"A={A_in_dtype}, B={B_in_dtype}"
+        )
+
+    if torch_latency is not None:
+        print(f"torch latency:{torch_latency} ms")
+        print(f"torch TFLOPS: {tflops / (torch_latency / 1e3)}")
 
     # Ensure that the latency is not None
     assert latency is not None

@@ -15,7 +15,6 @@ from tilelang.intrinsics import get_swizzle_layout
 from tilelang.intrinsics.mma_cim_macro_generator import (
     TensorCoreIntrinEmitter,)
 import torch
-from typing import Callable
 
 tilelang.disable_cache()
 
@@ -36,19 +35,6 @@ def make_swizzle_layout(shared_buf):
     return T.Layout(shape, transform_func)
 
 
-def benchmark_cuda(func: Callable[[], None], warmup: int = 10,
-                   repeat: int = 100) -> float:
-    for _ in range(warmup):
-        func()
-    torch.cuda.synchronize()
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    start.record()
-    for _ in range(repeat):
-        func()
-    end.record()
-    torch.cuda.synchronize()
-    return start.elapsed_time(end) / repeat
 
 
 # ── kernel ───────────────────────────────────────────────────────────────────
@@ -308,9 +294,9 @@ def main(
     fake_instr_m=16,
     fake_instr_n=8,
     fake_instr_k=16,
-    block_M=64,
-    block_N=64,
-    block_row_warps=2,
+    block_M=128,
+    block_N=128,
+    block_row_warps=4,
     block_col_warps=2,
     stage=1,
 ):
@@ -328,16 +314,10 @@ def main(
         stage=stage,
     )
 
-    print(kernel.get_kernel_source())
+    # print(kernel.get_kernel_source())
 
-    Q = torch.randn(batch, seq_len, heads, dim, dtype=torch.float16, device="cuda")
-    K = torch.randn(batch, seq_len, heads, dim, dtype=torch.float16, device="cuda")
-    V = torch.randn(batch, seq_len, heads, dim, dtype=torch.float16, device="cuda")
-
-    # Smoke test
-    _ = kernel(Q, K, V)
-
-    latency = benchmark_cuda(lambda: kernel(Q, K, V), warmup=20, repeat=200)
+    profiler = kernel.get_profiler()
+    latency = profiler.do_bench(n_warmup=50, n_repeat=200)
     print(f"CIM Flash Attention latency: {latency:.4f} ms")
     print(f"CIM Flash Attention TFLOPs:  {total_flops / (latency / 1e3) / 1e12:.2f}")
 
@@ -371,9 +351,9 @@ if __name__ == "__main__":
     parser.add_argument("--fake_instr_m", type=int, default=16)
     parser.add_argument("--fake_instr_n", type=int, default=8)
     parser.add_argument("--fake_instr_k", type=int, default=16)
-    parser.add_argument("--block_M", type=int, default=64)
-    parser.add_argument("--block_N", type=int, default=64)
-    parser.add_argument("--block_row_warps", type=int, default=2)
+    parser.add_argument("--block_M", type=int, default=128)
+    parser.add_argument("--block_N", type=int, default=128)
+    parser.add_argument("--block_row_warps", type=int, default=4)
     parser.add_argument("--block_col_warps", type=int, default=2)
     parser.add_argument("--stage", type=int, default=1)
 
