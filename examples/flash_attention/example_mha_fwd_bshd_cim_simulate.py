@@ -113,10 +113,10 @@ def flashattn_cim(
     )
 
     # MMA1: S[block_M, block_N] * V[block_N, dim]  → acc_o[block_M, dim]
-    #       A = S (shared),  B = V (shared, CIM),  b_transposed = True
-    #       V is stored as (block_N, dim) in shared; with b_transposed=True the
-    #       emitter treats it as (N_out=dim, K_red=block_N).  The layout mismatch
-    #       does not affect latency measurement.
+    #       A = S (fragment, Route B),  B = V (shared, CIM),  b_transposed = True
+    #       Route B: acc_s_cast fragment is passed directly to mma as A operand,
+    #       skipping the S_shared round-trip.  fake_warp_rows=1 matches the
+    #       fragment per-ki stride (local_size_a elements per ki step).
     #
     mma1 = TensorCoreIntrinEmitter(
         a_dtype=dtype, b_dtype=dtype, accum_dtype=accum_dtype,
@@ -126,7 +126,7 @@ def flashattn_cim(
         chunk=chunk_1,
         fake_instr_m=fake_instr_m, fake_instr_n=fake_instr_n,
         fake_instr_k=fake_instr_k,
-        fake_warp_rows=fake_warp_rows, fake_warp_cols=fake_warp_cols_1,
+        fake_warp_rows=1, fake_warp_cols=fake_warp_cols_1,
     )
 
     # ── buffer shapes ────────────────────────────────────────────────────
@@ -150,16 +150,10 @@ def flashattn_cim(
             Q_shared = T.alloc_shared([block_M, dim], dtype, scope=shared_scope)
             K_shared = T.alloc_shared([block_N, dim], dtype, scope=shared_scope)
             V_shared = T.alloc_shared([block_N, dim], dtype, scope=shared_scope)
-            # S_shared: stmatrix output of MMA0 scores → ldmatrix_a input of MMA1
-            S_shared = T.alloc_shared([block_M, block_N], dtype, scope=shared_scope)
-            # Reuse S_shared as O_shared for final writeback (they are not live at
-            # the same time).  Allocate a separate O_shared only when dim > block_N.
             O_shared = T.alloc_shared([block_M, dim], dtype, scope=shared_scope)
 
             # ── local / fragment buffers ─────────────────────────────────
-            # A-operand local buffers for ldmatrix_a
             A_local_0 = T.alloc_local(a_local_size, dtype)
-            A_local_1 = T.alloc_local(a_local_size, dtype)
             B_local = T.alloc_local(1, dtype)  # placeholder (CIM skips B load)
 
             # Fragment accumulators (shaped for softmax / rescale ops)
@@ -251,20 +245,16 @@ def flashattn_cim(
                     acc_o[i, j] *= scores_scale[i]
 
                 # ═══════════════════════════════════════════════════════
-                # Write S scores to shared for MMA1's A operand
-                # ═══════════════════════════════════════════════════════
-                T.copy(acc_s_cast, S_shared)
-
-                # ═══════════════════════════════════════════════════════
                 # MMA1:  S * V  →  acc_o  [block_M × dim]
-                # V stays in shared (CIM); S loaded via ldmatrix_a
+                # Route B: acc_s_cast fragment passed directly as A operand
+                # V stays in shared (CIM)
                 # ═══════════════════════════════════════════════════════
                 T.copy(V[bz, ko * block_N:(ko + 1) * block_N, by, :], V_shared)
 
                 for ki in T.serial(chunk_1 // micro_size_k):
-                    mma1.ldmatrix_a(A_local_1, S_shared, ki)
                     mma1.mma(
-                        A_local_1, V_shared, acc_o,
+                        acc_s_cast, V_shared, acc_o,
+                        k_inner=ki,
                         cim_simulate=True,
                         offset=(warp_col_tiles_1 * warp_idx) * block_N,
                     )
