@@ -1,28 +1,29 @@
+"""
+CIM-simulated Flash Attention (BSHD layout) using T.gemm(cim_simulate=True)
+with micro_m/n/k ratio control.
+
+cim_simulate=True automatically uses gemm_v1 (C++ lowering with CuTE template).
+The generated CUDA code is identical to baseline minus B ldmatrix instructions,
+with optional A-load frequency and M×N grouping control via micro ratios.
+Results are numerically incorrect — this is a latency-only CIM benchmark.
+"""
 import torch
-import torch.nn.functional as F
 import tilelang
-from tilelang.autotuner import *
 import tilelang.language as T
-import itertools
 import argparse
-from functools import partial
 
 tilelang.disable_cache()
 
-def get_configs():
-    iter_params = dict(block_M=[64], block_N=[64], num_stages=[1], threads=[128])
-    return [dict(zip(iter_params, values)) for values in itertools.product(*iter_params.values())]
 
-
-@autotune(configs=get_configs(), warmup=10, rep=10)
 @tilelang.jit(
     out_idx=[3],
     pass_configs={
         tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
     },
 )
-def flashattn(batch, heads, seq_len, dim, is_causal,
-              block_M=128, block_N=128, num_stages=1, threads=256):
+def flashattn_cim(batch, heads, seq_len, dim, is_causal,
+                  block_M=128, block_N=128, num_stages=1, threads=256,
+                  micro_m=0, micro_n=0, micro_k=0):
     scale = (1.0 / dim) ** 0.5 * 1.44269504  # log2(e)
     shape = [batch, seq_len, heads, dim]
     dtype = T.float16
@@ -70,7 +71,9 @@ def flashattn(batch, heads, seq_len, dim, is_causal,
                         acc_s[i, j] = T.if_then_else(
                             k * block_N + j >= seq_len, -T.infinity(acc_s.dtype), 0)
                 T.gemm(Q_shared, K_shared, acc_s, transpose_B=True,
-                       policy=T.GemmWarpPolicy.FullRow)
+                       policy=T.GemmWarpPolicy.FullRow,
+                       cim_simulate=True,
+                       cim_micro_m=micro_m, cim_micro_n=micro_n, cim_micro_k=micro_k)
 
                 T.copy(scores_max, scores_max_prev)
                 T.fill(scores_max, -T.infinity(accum_dtype))
@@ -90,7 +93,9 @@ def flashattn(batch, heads, seq_len, dim, is_causal,
                     acc_o[i, j] *= scores_scale[i]
 
                 T.copy(V[bz, k * block_N : (k + 1) * block_N, by, :], V_shared)
-                T.gemm(acc_s_cast, V_shared, acc_o, policy=T.GemmWarpPolicy.FullRow)
+                T.gemm(acc_s_cast, V_shared, acc_o, policy=T.GemmWarpPolicy.FullRow,
+                       cim_simulate=True,
+                       cim_micro_m=micro_m, cim_micro_n=micro_n, cim_micro_k=micro_k)
 
             for i, j in T.Parallel(block_M, dim):
                 acc_o[i, j] /= logsum[i]
@@ -100,70 +105,41 @@ def flashattn(batch, heads, seq_len, dim, is_causal,
     return main
 
 
-def ref_program(Q, K, V, is_causal):
-    dim = Q.size(-1)
-    scores = torch.einsum("bqhd,bkhd->bhqk", Q, K)
-    scores = scores / torch.sqrt(torch.tensor(dim, dtype=scores.dtype))
-    if is_causal:
-        seq_len = Q.size(1)
-        mask = torch.tril(torch.ones(seq_len, seq_len, device=scores.device))
-        mask = mask.unsqueeze(0).unsqueeze(0)
-        scores = scores.masked_fill(mask == 0, float("-inf"))
-    attention_weights = F.softmax(scores, dim=-1)
-    output = torch.einsum("bhqk,bkhd->bqhd", attention_weights, V)
-    return output
-
-
 def main(
     batch: int = 8,
     heads: int = 32,
     seq_len: int = 4096,
     dim: int = 128,
     is_causal: bool = False,
-    tune: bool = False,
+    micro_m: int = 0,
+    micro_n: int = 0,
+    micro_k: int = 0,
 ):
     flops_per_matmul = 2.0 * batch * heads * seq_len * seq_len * dim
     total_flops = 2 * flops_per_matmul
     if is_causal:
         total_flops *= 0.5
 
-    if not tune:
-        kernel = flashattn(batch, heads, seq_len, dim, is_causal,
-                           block_M=128, block_N=128, num_stages=1, threads=256)
-        ref_program_processed = partial(ref_program, is_causal=is_causal)
-        profiler = kernel.get_profiler()
-        profiler.assert_allclose(ref_program_processed, rtol=0.01, atol=0.01)
-        print("All checks pass.")
-        latency = profiler.do_bench(ref_program_processed, n_warmup=50, n_repeat=200)
-        print("Ref: {:.2f} ms".format(latency))
-        print("Ref: {:.2f} TFlops".format(total_flops / latency * 1e-9))
-        latency = profiler.do_bench(n_warmup=50, n_repeat=200)
-        print("Tile-lang: {:.2f} ms".format(latency))
-        print("Tile-lang: {:.2f} TFlops".format(total_flops / latency * 1e-9))
-    else:
-        best_result = flashattn(batch, heads, seq_len, dim, is_causal)
-        best_latency = best_result.latency
-        best_config = best_result.config
-        ref_latency = best_result.ref_latency
-        print(f"Best latency: {best_latency}")
-        print(f"Best TFlops: {total_flops / best_latency * 1e-9}")
-        print(f"Best config: {best_config}")
-        print(f"Ref latency: {ref_latency}")
-
-
-def run_regression_perf(batch: int = 8, heads: int = 32, seq_len: int = 4096, dim: int = 128, is_causal: bool = False):
-    kernel = flashattn(batch, heads, seq_len, dim, is_causal, block_M=128, block_N=128, num_stages=1, threads=128)
+    kernel = flashattn_cim(batch, heads, seq_len, dim, is_causal,
+                           block_M=128, block_N=128, num_stages=1, threads=256,
+                           micro_m=micro_m, micro_n=micro_n, micro_k=micro_k)
     profiler = kernel.get_profiler()
-    return profiler.do_bench(backend="cupti", n_warmup=50, n_repeat=200)
+    latency = profiler.do_bench(backend="cupti", n_warmup=50, n_repeat=200)
+    micro_str = f"micro={micro_m}/{micro_n}/{micro_k}" if any([micro_m, micro_n, micro_k]) else "micro=default"
+    print(f"CIM FA ({micro_str}): {latency:.2f} ms, {total_flops / latency * 1e-9:.2f} TFlops")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description="CIM Flash Attention with CIM instruction shape control")
     parser.add_argument("--batch", type=int, default=8, help="batch size")
     parser.add_argument("--heads", type=int, default=32, help="heads")
     parser.add_argument("--seq_len", type=int, default=4096, help="sequence length")
     parser.add_argument("--dim", type=int, default=128, help="dim")
     parser.add_argument("--is_causal", action="store_true", help="causal")
-    parser.add_argument("--tune", action="store_true", help="tune configs")
+    parser.add_argument("--micro_m", type=int, default=0, help="CIM instruction M dim (0=default)")
+    parser.add_argument("--micro_n", type=int, default=0, help="CIM instruction N dim (0=default)")
+    parser.add_argument("--micro_k", type=int, default=0, help="CIM instruction K dim (0=default)")
     args = parser.parse_args()
-    main(args.batch, args.heads, args.seq_len, args.dim, args.is_causal, args.tune)
+    main(args.batch, args.heads, args.seq_len, args.dim, args.is_causal,
+         args.micro_m, args.micro_n, args.micro_k)
