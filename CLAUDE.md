@@ -8,7 +8,6 @@ TileLang is a tile-level DSL for high-performance GPU/CPU kernels (GEMM, FlashAt
 
 - `tilelang/` — Python package (editable install, changes take effect immediately)
 - `src/` — C++ TileLang passes and codegen
-- `src/tl_templates/cuda/` — CUDA template headers (included at NVRTC compile time)
 - `3rdparty/tvm/` — Bundled TVM (submodule)
 - `3rdparty/cutlass/` — CUTLASS headers
 - `examples/` — Example kernels
@@ -29,72 +28,96 @@ cd build && ninja
 
 Key: `--no-build-isolation` avoids pip creating a temp build env, which causes stale cmake paths.
 
-## CIM Simulation Architecture
+## CIM Simulation via T.gemm
 
 ### What CIM simulates
 
-CIM (Computing-in-Memory) models a hypothetical GPU where the B matrix (weights) resides in on-chip memory. In A×B, only A data needs to be loaded; B is accessed via an address hook rather than data transfer. The simulation currently runs on real GPUs (A100) to measure CIM data-flow performance characteristics.
+CIM (Computing-in-Memory) models a GPU where the B matrix (weights) resides in on-chip memory. In A×B, only A data needs to be loaded; B is accessed via an address hook rather than data transfer. The simulation runs on real GPUs (A100) to measure CIM data-flow performance characteristics.
 
-### Three-layer parameter system
+### How it works
 
-CIM kernels decouple three concerns:
+`T.gemm(A, B, C, cim_simulate=True)` generates a kernel identical to baseline except B's ldmatrix (shared → register load) is skipped. This goes through **gemm_v2** (Python lowering via `TensorCoreIntrinEmitter`), not CuTE templates.
 
-**Layer 1: `A_in_dtype` / `B_in_dtype`** — The simulated data type for memory traffic. Controls data packing ratios and copy strides (e.g., int8 packs 2× denser than fp16). Only affects global→shared copy shape calculations (`A_shape`, `B_shape`, `data_map[dtype] // 16`).
+Pipeline:
+```
+T.gemm(cim_simulate=True, cim_micro_m=0, cim_micro_n=0, cim_micro_k=0)
+  → gemm_op.py: passes cim params as args 19-22 in call_intrin
+  → gemm_py.cc: GemmPyNode parses cimSimulate_, cimMicroM_/N_/K_
+  → gemm_mma.py: GemmMMA.lower() skips mma_emitter.ldmatrix_b() when cim_simulate
+  → Generated TIR: same ldmatrix_a + ptx_mma, no ldmatrix_b
+```
 
-**Layer 2: `micro_m/n/k`** — The simulated CIM instruction shape. Can be arbitrary (e.g., 1×64×64). Controls:
-- Loop structure: `for ki in T.serial(block_K // micro_k)`
-- Warp tiling: `warp_rows = warp_row_tiles // micro_m`
-- Buffer allocation sizes: `local_size_a = (micro_m * micro_k) // warp_size`
-- C_shared shape: `(block_M // micro_m, block_N // micro_n, fake_instr_m, fake_instr_n)`
+### CIM micro_m/n/k parameters
 
-**Layer 3: `fake_instr_m/n/k`** — The real GPU MMA instruction shape. Must be a valid PTX MMA shape (e.g., `m16n8k16` for fp16). The emitter is **always hardcoded to `a_dtype="float16", b_dtype="float16"`** regardless of `A_in_dtype`/`B_in_dtype`. This means the actual PTX instruction is always an fp16 MMA, even when the simulated data type is int8 or int4. This is intentional: CIM simulation measures data-flow latency, not computational correctness.
+`T.gemm(..., cim_micro_m=2, cim_micro_n=64, cim_micro_k=32)` specifies the CIM instruction shape. These are actual dimensions (not ratios). Default 0 = use hardware MMA shape.
 
-Valid `fake_instr` shapes (determined by the hardcoded fp16 dtype):
-- `m16n8k16` (default, most common)
-- Other shapes would require changing the hardcoded dtype in the emitter
+Currently passed through to C++ `GemmPyNode` for future use. The v2 lower path can be extended to control loop structure based on micro values (TODO).
 
-**Data positions within `ldmatrix_a` and `mma` are governed by `fake_instr`, not `micro`.** The CIM micro shape controls the loop cadence and buffer sizing (simulating "how data flows if CIM hardware processed micro_m×micro_n×micro_k per instruction"), while the actual shared-memory access pattern follows the real GPU instruction layout.
+### Performance results (A100)
 
-### Code path through the stack
+| Kernel | Baseline | CIM | Speedup |
+|--------|----------|-----|---------|
+| FA (fp16, 128x128, 256t, b8h32s4096d128) | 14.88 ms / 147.8 TF | 11.81 ms / 186.3 TF | **1.26x** |
+| GEMM (int8, 8192x8192x4096, transpose_B) | 1.79 ms / 307 TOPS | 1.73 ms / 319 TOPS | **1.04x** |
 
-1. **Python API** (`tilelang/language/tir/op.py`): `T.ptx_mma(..., cim_simulate=True)` appends a boolean flag to the TIR call args.
+### Files modified (on top of upstream v0.1.8)
 
-2. **C++ codegen** (`src/target/codegen_cuda.cc`): Detects the cim flag. When active, emits `tl::mma_sync<..., false, true>` (Saturate=false, CimSimulate=true). Non-CIM path is unchanged.
+- `tilelang/language/gemm_op.py` — `cim_simulate`, `cim_micro_m/n/k` params
+- `src/op/gemm_py.h` + `gemm_py.cc` — `cimSimulate_`, `cimMicroM_/N_/K_` fields + reflection + parsing
+- `tilelang/tileop/gemm/gemm_base.py` — CIM property accessors
+- `tilelang/tileop/gemm/gemm_mma.py` — `lower()` skips B ldmatrix when `cim_simulate`
 
-3. **CUDA template** (`src/tl_templates/cuda/instruction/mma.h`): `MmaDispatcher` with `CimSimulate=true` calls `call_fma_cim_simulation` instead of `call_fma`. This replaces all B register values with `&b[0]`'s address:
-   ```cpp
-   const auto b0_addr = reinterpret_cast<std::uintptr_t>(&b[0]);
-   Impl::fma(d[DIdx]..., a[AIdx]...,
-             ((void)BIdx, static_cast<BReg>(b0_addr))..., c[CIdx]...);
-   ```
+Zero changes to: C++ codegen, CUDA templates, CuTE, ptx_mma intrinsics.
 
-4. **CIM Macro Generator** (`tilelang/intrinsics/mma_cim_macro_generator.py`): Subclasses upstream `TensorCoreIntrinEmitter`. Key overrides:
-   - `ldmatrix_b`: loads only 1 tile (address hook, not full data)
-   - `mma`: passes `B_shared.access_ptr(offset=...)` + `cim_simulate=True`
-   - `stmatrix`: respects `fake_warp_rows/cols`
+### CIM-specific example files
 
-### Shared memory swizzle
+T.gemm-level CIM (recommended):
+- `examples/gemm/example_gemm_baseline.py` — GEMM baseline
+- `examples/gemm/example_gemm_cim.py` — GEMM CIM (supports `--micro_m/n/k`)
+- `examples/flash_attention/example_mha_fwd_bshd_baseline.py` — FA baseline
+- `examples/flash_attention/example_mha_fwd_bshd_cim.py` — FA CIM (supports `--micro_m/n/k`)
 
-Swizzle (XOR-based bank conflict avoidance) is **preserved in CIM mode**. The `T.annotate_layout` + `make_swizzle_layout` annotations on A_shared produce identical XOR patterns in cp_async (global→shared) and ldmatrix (shared→local) as the upstream non-CIM path.
+Intrinsic-level CIM (for custom micro_m/n/k loop structure experiments):
+- `tilelang/intrinsics/mma_cim_macro_generator.py` — CIM emitter subclass
+- `examples/gemm/example_gemm_baseline_intrinsic.py` — GEMM baseline (intrinsic, `--dtype int8/float16`)
+- `examples/gemm/example_gemm_cim_intrinsic.py` — GEMM CIM (intrinsic, `--dtype --micro_m/n/k --cim_stride_index --tracekernel`)
+- `examples/gemm/example_gemm_intrinsic_kernel.py` — Intrinsic kernel with CUDA postproc
+- `examples/flash_attention/example_mha_fwd_bshd_cim_intrinsic.py` — FA CIM (intrinsic)
 
-### CIM-specific files
+### Intrinsic CIM architecture (3 principles)
 
-- `tilelang/intrinsics/mma_cim_macro_generator.py` — CIM emitter (subclass, ~320 lines)
-- `examples/gemm/example_gemm_cim_simulate.py` — CIM GEMM benchmark
-- `examples/gemm/example_gemm_intrinsic_kernel.py` — Intrinsic-level kernel with CUDA postproc
-- `examples/gemm/example_gemm_mma_intrinsic_baseline.py` — Non-CIM baseline for comparison
-- `examples/flash_attention/example_mha_fwd_bshd_cim_simulate.py` — CIM FlashAttention
+The intrinsic CIM emitter (`CIMTensorCoreIntrinEmitter`) generates MMA instructions based on three principles:
+
+1. **C_local = warp_m × warp_n / 32** — output accumulator size determined by warp tile, constant across micro configs.
+2. **A_local = warp_m × micro_k / 32** — determined by dtype and micro_k. Each ki step loads the full A_local via ldmatrix (multiple K sub-passes when micro_k > mma_k). ki iterations = block_K / micro_k.
+3. **MMA count = (warp_m/micro_m) × (warp_n/micro_n) per ki** — each GPU MMA represents one CIM instruction. The number of CIM instructions per ki is controlled by micro_m/n.
+
+A/C register indexing supports two modes (`cim_stride_index`):
+- **hw cycling** (default, `False`): A/C indices cycle through hardware MMA positions (`i % hw_warp_rows`). Same access pattern as real GPU, no register bank conflict. Better performance on A100.
+- **cim stride** (`True`): A/C indices use CIM micro-based strides (`micro_m × micro_k / 32`). Models the CIM architecture more accurately, but causes overlapping register reads and worse GPU performance.
+
+### Intrinsic CIM key parameters
+
+| Parameter | Controls | Default |
+|-----------|----------|---------|
+| `micro_m/n` | MMA count per ki, CIM instruction shape | = MMA shape (16/8) |
+| `micro_k` | ki loop count, A load frequency | = mma_k (32 for int8) |
+| `fake_instr_m/n/k` | Hardware MMA shape (auto from dtype) | 16/8/32 (int8) |
+| `cim_stride_index` | Register index mode | False (hw cycling) |
+| `T.sync_threads()` between A/B copies | CIM-specific optimization (improves DRAM locality) | Optional |
 
 ## Syncing with Upstream
 
 Current CIM branch (`cim-v2`) is based on **upstream v0.1.8** (`git tag v0.1.8`, commit `41b25527`).
 
-`mma_cim_macro_generator.py` is a **subclass override** of upstream's `mma_macro_generator.py::TensorCoreIntrinEmitter`. It overrides 6 methods (`__init__`, `_initialize_k_dim`, `_initialize_micro_size`, `ldmatrix_a`, `ldmatrix_b`, `mma`, `stmatrix`) and inherits everything else. This means:
+CIM changes are minimal (4 upstream files modified). After syncing:
+1. Check `gemm_py.h/cc` — CIM fields may need updating if GemmPyNode changes
+2. Check `gemm_mma.py` — CIM lower logic may need updating if `_gemm_ssr`/`_gemm_rsr` change
+3. Run `examples/gemm/example_gemm_cim.py` and `examples/flash_attention/example_mha_fwd_bshd_cim.py` as smoke tests
 
-- **On every upstream sync**, check whether `mma_macro_generator.py` has changed. If the base class `__init__` signature, internal attribute names, or overridden method signatures changed, `mma_cim_macro_generator.py` must be updated accordingly.
-- An import-time compatibility guard (`_EXPECTED_BASE_INIT_PARAMS`, `_EXPECTED_BASE_METHODS`) will emit a warning if the base class interface has drifted.
-- After syncing, always run `examples/gemm/example_gemm_cim_simulate.py` as a smoke test.
+`mma_cim_macro_generator.py` (intrinsic path) subclasses upstream's `TensorCoreIntrinEmitter`. An import-time guard warns if the base class interface drifts.
 
 ## Conventions
 
-- When modifying C++ codegen for CIM, keep the non-CIM code path identical to upstream (conditional emission only when `cim_flag=true`).
+- Do not use `@simplify_prim_func` with `@tilelang.jit` — triggers an upstream AST parser bug with `*args`.
+- CIM changes only touch Python-level lowering (gemm_v2 path). No C++ template or codegen modifications.

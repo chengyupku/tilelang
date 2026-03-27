@@ -5,13 +5,14 @@ CIM (Compute-In-Memory) variant of TensorCoreIntrinEmitter.
 Subclasses the upstream ``TensorCoreIntrinEmitter`` and overrides only
 the behaviour that differs for CIM simulation:
 
-* Custom ``fake_instr_*`` / ``fake_warp_*`` constructor parameters
-* Hardcoded ``warp_cols = 1`` in ``_initialize_micro_size``
+* Custom ``fake_instr_m/n/k`` to override MMA instruction dimensions
+* ``_initialize_micro_size`` derives warp_rows/warp_cols from hardware MMA
+  tile shape (M_DIM × n_dim), ensuring ldmatrix/mma/stmatrix use consistent
+  tiling.  CIM micro_m/n/k only affects the outer ki loop (A load frequency).
 * Simplified ``ldmatrix_a`` / ``ldmatrix_b`` (no BufferRegion legalization,
   CIM-specific loop bounds)
 * ``mma`` gains ``cim_simulate`` and ``offset`` arguments forwarded to
   ``T.ptx_mma``
-* ``stmatrix`` respects ``fake_warp_rows`` / ``fake_warp_cols``
 """
 
 from __future__ import annotations
@@ -76,8 +77,13 @@ class CIMTensorCoreIntrinEmitter(_BaseTensorCoreIntrinEmitter):
 
     Extends the upstream ``TensorCoreIntrinEmitter`` with:
     - ``fake_instr_m/n/k`` to override MMA instruction dimensions
-    - ``fake_warp_rows/cols`` to override warp tiling in ``mma``/``stmatrix``
+    - MMA-based warp tiling (warp_rows/warp_cols derived from M_DIM/n_dim)
     - ``cim_simulate`` flag passed through to ``T.ptx_mma``
+
+    The CIM micro shape (micro_m/n/k) is NOT handled by the emitter — it
+    only controls the outer ki loop in the caller.  Internally, the emitter
+    always tiles in hardware MMA units so ldmatrix/mma/stmatrix indexing is
+    consistent.
     """
 
     def __init__(
@@ -101,6 +107,10 @@ class CIMTensorCoreIntrinEmitter(_BaseTensorCoreIntrinEmitter):
         fake_instr_k: int | None = None,
         fake_warp_rows: int | None = None,
         fake_warp_cols: int | None = None,
+        cim_micro_m: int | None = None,
+        cim_micro_n: int | None = None,
+        cim_micro_k: int | None = None,
+        cim_stride_index: bool = False,
     ):
         # Pre-set fake instruction dims *before* the base __init__ calls
         # _initialize_k_dim / _initialize_micro_size, so they can be picked up.
@@ -111,6 +121,14 @@ class CIMTensorCoreIntrinEmitter(_BaseTensorCoreIntrinEmitter):
 
         self.fake_warp_rows = fake_warp_rows
         self.fake_warp_cols = fake_warp_cols
+
+        # CIM micro dims for local buffer stride calculation
+        self._cim_micro_m = cim_micro_m
+        self._cim_micro_n = cim_micro_n
+        self._cim_micro_k = cim_micro_k
+        # Index mode: True = CIM stride (micro-based, models CIM arch),
+        #             False = hw cycling (GPU-native, better perf on real GPU)
+        self.cim_stride_index = cim_stride_index
 
         super().__init__(
             a_dtype=a_dtype,
@@ -129,14 +147,28 @@ class CIMTensorCoreIntrinEmitter(_BaseTensorCoreIntrinEmitter):
             thread_var=thread_var,
         )
 
-        # Re-validate with effective warp dims (fake overrides).
+        # Validate effective warp dims (fake overrides for mma/stmatrix).
         _eff_warp_rows = fake_warp_rows if fake_warp_rows is not None else self.warp_rows
         _eff_warp_cols = fake_warp_cols if fake_warp_cols is not None else self.warp_cols
         if _eff_warp_rows == 0 or _eff_warp_cols == 0:
             raise ValueError(
-                f"Invalid threads configuration for this tile shape, "
-                f"{self.warp_rows} x {self.warp_cols} with threads {self.threads}"
+                f"Invalid CIM warp configuration: "
+                f"warp_rows={self.warp_rows}, warp_cols={self.warp_cols}, "
+                f"fake_warp_rows={fake_warp_rows}, fake_warp_cols={fake_warp_cols}"
             )
+
+        # CIM-based local strides for mma/stmatrix indexing.
+        # When micro dims are given, stride = micro_m * micro_k/n / warp_size.
+        # This ensures mma loop accesses fit within A_local/C_local sized by
+        # warp_m*micro_k/32 and warp_m*warp_n/32 respectively.
+        if cim_micro_m is not None and cim_micro_k is not None:
+            self.cim_local_size_a = (cim_micro_m * cim_micro_k) // self.WARP_SIZE
+        else:
+            self.cim_local_size_a = self.local_size_a  # fallback to MMA-based
+        if cim_micro_m is not None and cim_micro_n is not None:
+            self.cim_local_size_out = (cim_micro_m * cim_micro_n) // self.WARP_SIZE
+        else:
+            self.cim_local_size_out = self.local_size_out
 
     # ------------------------------------------------------------------
     # Overridden initialisation helpers
@@ -150,12 +182,15 @@ class CIMTensorCoreIntrinEmitter(_BaseTensorCoreIntrinEmitter):
         self.k_dim = 256 // a_dtype.bits
 
     def _initialize_micro_size(self, m_dim: int = 16, k_dim: int = 16):
-        """CIM always uses ``warp_cols = 1`` and ``micro_size_y = n_dim``."""
-        warp_rows = self.warp_row_tiles // m_dim
-        if warp_rows == 0 and getattr(self, "fake_warp_rows", None) is not None:
-            warp_rows = 1
-        self.warp_rows = warp_rows
-        self.warp_cols = 1
+        """Compute warp tiling from hardware MMA dimensions.
+
+        Unlike the old approach that hardcoded ``warp_cols = 1`` and relied on
+        ``fake_warp_rows/cols`` to patch mma/stmatrix, we now derive warp_rows
+        and warp_cols directly from the hardware MMA tile shape (M_DIM × n_dim).
+        This ensures ldmatrix, mma, and stmatrix all use the same tiling.
+        """
+        self.warp_rows = self.warp_row_tiles // m_dim
+        self.warp_cols = self.warp_col_tiles // self.n_dim
         self.micro_size_x = m_dim
         self.micro_size_y = self.n_dim
         self.micro_size_k = k_dim
@@ -165,11 +200,16 @@ class CIMTensorCoreIntrinEmitter(_BaseTensorCoreIntrinEmitter):
     # ------------------------------------------------------------------
 
     def ldmatrix_a(self, A_local_buf: Buffer, A_shared_buf: Buffer,
-                   ki: PrimExpr, rk: PrimExpr | None = 0):
+                   ki: PrimExpr, rk: PrimExpr | None = 0,
+                   a_local_offset: int = 0):
+        """Load A from shared into local fragment.
+
+        Args:
+            a_local_offset: byte-element offset into A_local_buf for this load.
+                Used when loading multiple mma_k sub-slices to fill A_local.
+        """
         warp_row_tiles = self.warp_row_tiles
-        warp_rows = T.ceildiv(
-            T.ceildiv(warp_row_tiles * self.micro_size_k, self.WARP_SIZE), 8
-        )
+        warp_rows = self.warp_rows
         chunk = self.chunk
         micro_size_x = self.micro_size_x
         micro_size_k = self.micro_size_k
@@ -212,14 +252,14 @@ class CIMTensorCoreIntrinEmitter(_BaseTensorCoreIntrinEmitter):
                         4,
                         ".b16",
                         A_local_buf.data,
-                        i * local_size_a,
+                        a_local_offset + i * local_size_a,
                         T.address_of(A_shared_buf_elem),
                         get_ldmatrix_offset("A", tx, 0, stride, a_dtype, a_transposed),
                     )
                 else:
                     for j in T.serial(local_size_a):
                         mi, mk = mma_load_layout(tx, j)
-                        A_local_buf[i * local_size_a + j] = A_shared_buf[wk + mk, wi + mi]
+                        A_local_buf[a_local_offset + i * local_size_a + j] = A_shared_buf[wk + mk, wi + mi]
 
         return _warp_ldmatrix_a(A_local_buf, A_shared_buf, ki, thread_binding, rk)
 
@@ -282,17 +322,25 @@ class CIMTensorCoreIntrinEmitter(_BaseTensorCoreIntrinEmitter):
         return _warp_ldmatrix_b(B_local_buf, B_shared_buf, ki, thread_binding, rk)
 
     # ------------------------------------------------------------------
-    # mma override (cim_simulate + offset + reversed loop + fake warp dims)
+    # mma override (cim_simulate + offset + CIM micro-based warp dims)
     # ------------------------------------------------------------------
 
     def mma(self, A_local_buf: Buffer, B_local_buf: Buffer, C_local_buf: Buffer,
             k_inner: PrimExpr | None = 0, cim_simulate: bool = False,
             offset: PrimExpr | None = 0):
+        # CIM loop: fake_warp_rows × fake_warp_cols iterations,
+        # each MMA call = one CIM instruction.
         warp_rows = self.warp_rows if self.fake_warp_rows is None else self.fake_warp_rows
         warp_cols = self.warp_cols if self.fake_warp_cols is None else self.fake_warp_cols
-        local_size_a = self.local_size_a
+        hw_warp_rows = self.warp_rows
+        hw_warp_cols = self.warp_cols
+        # A/C stride: CIM-based or hw-cycling depending on cim_stride_index
+        use_cim_stride = self.cim_stride_index
+        local_size_a_hw = self.local_size_a
         local_size_b = self.local_size_b
-        local_size_out = self.local_size_out
+        local_size_out_hw = self.local_size_out
+        local_size_a_cim = self.cim_local_size_a
+        local_size_out_cim = self.cim_local_size_out
         a_dtype_abbrv = self.a_dtype_abbrv
         b_dtype_abbrv = self.b_dtype_abbrv
         accum_dtype = self.accum_dtype
@@ -302,45 +350,50 @@ class CIMTensorCoreIntrinEmitter(_BaseTensorCoreIntrinEmitter):
 
         a_is_fragment = is_fragment(A_local_buf)
         b_is_fragment = is_fragment(B_local_buf)
-        a_local_stride: PrimExpr = k_inner * warp_rows * local_size_a if a_is_fragment else 0
-        b_local_stride: PrimExpr = k_inner * warp_cols * local_size_b if b_is_fragment else 0
+        if use_cim_stride:
+            a_local_stride: PrimExpr = k_inner * warp_rows * local_size_a_cim if a_is_fragment else 0
+        else:
+            a_local_stride: PrimExpr = k_inner * hw_warp_rows * local_size_a_hw if a_is_fragment else 0
+        b_local_stride: PrimExpr = k_inner * hw_warp_cols * local_size_b if b_is_fragment else 0
 
         @T.macro
         def _warp_mma(A_local_buf, B_local_buf, C_local_buf):
             for j, i in T.grid(warp_cols, warp_rows):
+                if use_cim_stride:
+                    # CIM stride: index by micro_m*micro_k/32 per iteration
+                    a_off = a_local_stride + i * local_size_a_cim
+                    c_off = i * warp_cols * local_size_out_cim + j * local_size_out_cim
+                else:
+                    # HW cycling: cycle through hardware MMA positions
+                    i_hw = i % hw_warp_rows
+                    j_hw = (i // hw_warp_rows + j) % hw_warp_cols
+                    a_off = a_local_stride + i_hw * local_size_a_hw
+                    c_off = i_hw * hw_warp_cols * local_size_out_hw + j_hw * local_size_out_hw
                 T.ptx_mma(
                     accum_dtype, mma_prefix, "row", "col",
                     a_dtype_abbrv, b_dtype_abbrv, accum_dtype_abbrv,
-                    A_local_buf.data,
-                    a_local_stride + i * local_size_a,
+                    A_local_buf.data, a_off,
                     B_local_buf.access_ptr(1, offset=offset),
-                    b_local_stride + j * local_size_b,
-                    C_local_buf.data,
-                    i * warp_cols * local_size_out + j * local_size_out,
-                    T.bool(False),
-                    None,
-                    cim_simulate,
+                    b_local_stride + (j if use_cim_stride else j_hw) * local_size_b,
+                    C_local_buf.data, c_off,
+                    T.bool(False), None, cim_simulate,
                 )
                 if replicate_b:
                     T.ptx_mma(
                         accum_dtype, mma_prefix, "row", "col",
                         a_dtype_abbrv, b_dtype_abbrv, accum_dtype_abbrv,
-                        A_local_buf.data,
-                        a_local_stride + i * local_size_a,
+                        A_local_buf.data, a_off,
                         B_local_buf.data,
-                        b_local_stride + j * local_size_b + lift(local_size_b) // 2,
-                        C_local_buf.data,
-                        i * warp_cols * local_size_out + j * local_size_out
-                        + lift(local_size_out) // 2,
-                        T.bool(False),
-                        None,
-                        cim_simulate,
+                        b_local_stride + (j if use_cim_stride else j_hw) * local_size_b
+                        + lift(local_size_b) // 2,
+                        C_local_buf.data, c_off + lift(local_size_out_hw) // 2,
+                        T.bool(False), None, cim_simulate,
                     )
 
         return _warp_mma(A_local_buf, B_local_buf, C_local_buf)
 
     # ------------------------------------------------------------------
-    # stmatrix override (fake warp dims)
+    # stmatrix override (CIM micro-based warp dims)
     # ------------------------------------------------------------------
 
     def stmatrix(self, C_local_buf, C_buf, pid_m=None, pid_n=None):
@@ -348,12 +401,17 @@ class CIMTensorCoreIntrinEmitter(_BaseTensorCoreIntrinEmitter):
         block_col_warps = self.block_col_warps
         warp_rows = self.warp_rows if self.fake_warp_rows is None else self.fake_warp_rows
         warp_cols = self.warp_cols if self.fake_warp_cols is None else self.fake_warp_cols
-        local_size_out = self.local_size_out
+        hw_warp_rows = self.warp_rows
+        hw_warp_cols = self.warp_cols
+        use_cim_stride = self.cim_stride_index
+        local_size_out_hw = self.local_size_out
+        local_size_out_cim = self.cim_local_size_out
 
         is_global = pid_m is not None and pid_n is not None
         BLOCK_M = block_row_warps * warp_rows
         BLOCK_N = block_col_warps * warp_cols
         M_DIM, n_dim = self.M_DIM, self.n_dim
+        local_size_out_inner = local_size_out_cim if use_cim_stride else local_size_out_hw
         C_buf_dims = len(C_buf.shape)
         assert C_buf_dims in {2, 4}, "C_buf should be 2D or 4D"
 
@@ -363,7 +421,13 @@ class CIMTensorCoreIntrinEmitter(_BaseTensorCoreIntrinEmitter):
         def _warp_stmatrix_shared(C_local_buf, C_buf, thread_binding):
             tx, warp_n, warp_m = self.extract_thread_binding(thread_binding)
             for i, j in T.grid(warp_rows, warp_cols):
-                for local_id_o in T.serial(local_size_out // 2):
+                if use_cim_stride:
+                    c_off_base = i * warp_cols * local_size_out_cim + j * local_size_out_cim
+                else:
+                    i_hw = i % hw_warp_rows
+                    j_hw = (i // hw_warp_rows + j) % hw_warp_cols
+                    c_off_base = i_hw * hw_warp_cols * local_size_out_hw + j_hw * local_size_out_hw
+                for local_id_o in T.serial(local_size_out_inner // 2):
                     for local_id_i in T.vectorized(2):
                         local_id = local_id_o * 2 + local_id_i
                         row, col = T.meta_var(mma_store_index_map(tx, local_id))
@@ -371,30 +435,30 @@ class CIMTensorCoreIntrinEmitter(_BaseTensorCoreIntrinEmitter):
                             C_buf[
                                 (warp_m * warp_rows + i) * M_DIM + row,
                                 (warp_n * warp_cols + j) * n_dim + col,
-                            ] = C_local_buf[
-                                i * (warp_cols * local_size_out) + j * local_size_out + local_id
-                            ]
+                            ] = C_local_buf[c_off_base + local_id]
                         else:
                             C_buf[
                                 warp_m * warp_rows + i, warp_n * warp_cols + j, row, col,
-                            ] = C_local_buf[
-                                i * (warp_cols * local_size_out) + j * local_size_out + local_id
-                            ]
+                            ] = C_local_buf[c_off_base + local_id]
 
         @T.macro
         def _warp_stmatrix_global(C_local_buf, C_buf, thread_binding):
             tx, warp_n, warp_m = self.extract_thread_binding(thread_binding)
             for i, j in T.grid(warp_rows, warp_cols):
-                for local_id_o in T.serial(local_size_out // 2):
+                if use_cim_stride:
+                    c_off_base = i * warp_cols * local_size_out_cim + j * local_size_out_cim
+                else:
+                    i_hw = i % hw_warp_rows
+                    j_hw = (i // hw_warp_rows + j) % hw_warp_cols
+                    c_off_base = i_hw * hw_warp_cols * local_size_out_hw + j_hw * local_size_out_hw
+                for local_id_o in T.serial(local_size_out_inner // 2):
                     for local_id_i in T.vectorized(2):
                         local_id = local_id_o * 2 + local_id_i
                         row, col = T.meta_var(mma_store_index_map(tx, local_id))
                         C_buf[
                             (pid_m * BLOCK_M + warp_m * warp_rows + i) * M_DIM + row,
                             (pid_n * BLOCK_N + warp_n * warp_cols + j) * n_dim + col,
-                        ] = C_local_buf[
-                            i * warp_cols * local_size_out + j * local_size_out + local_id
-                        ]
+                        ] = C_local_buf[c_off_base + local_id]
 
         return (
             _warp_stmatrix_global(C_local_buf, C_buf, thread_binding)

@@ -8,6 +8,12 @@ import os
 
 tilelang.disable_cache()
 
+# dtype → (A/B dtype, accum dtype, output dtype)
+DTYPE_CONFIGS = {
+    "int8":    ("int8",    "int32",   "int32"),
+    "float16": ("float16", "float32", "float16"),
+}
+
 def str_to_bool(value):
     if isinstance(value, bool):
         return value
@@ -17,7 +23,7 @@ def str_to_bool(value):
         return False
     else:
         raise argparse.ArgumentTypeError('Boolean value expected.')
-    
+
 def main(
     M,
     N,
@@ -27,15 +33,14 @@ def main(
     chunk,
     block_row_tiles,
     block_col_tiles,
-    A_in_dtype,
-    B_in_dtype,
-    C_in_dtype,
-    C_out_dtype,
+    dtype,
     stage,
     tracekernel,
     use_shmem_writeback,
     use_zero_benchmark=False
 ):
+    in_dtype, accum_dtype, out_dtype = DTYPE_CONFIGS[dtype]
+
     kernel = tl_matmul(
         M,
         N,
@@ -45,63 +50,53 @@ def main(
         chunk,
         block_row_tiles,
         block_col_tiles,
-        A_in_dtype,
-        B_in_dtype,
-        C_in_dtype,
-        C_out_dtype,
+        in_dtype,
+        in_dtype,
+        accum_dtype,
+        out_dtype,
         stage=stage,
         use_shmem_writeback=use_shmem_writeback,
     )
 
     # Get CUDA Source
     source = kernel.get_kernel_source()
-    print(source)
+    # print(source)
 
-    A_in_dtype = map_torch_type(A_in_dtype)
-    B_in_dtype = map_torch_type(B_in_dtype)
-    C_out_dtype = map_torch_type(C_out_dtype)
-    C_in_dtype = map_torch_type(C_in_dtype)
+    A_torch = map_torch_type(in_dtype)
+    B_torch = map_torch_type(in_dtype)
+    C_torch = map_torch_type(out_dtype)
 
     if use_zero_benchmark:
-        if A_in_dtype in {torch.int8, torch.int32}:
-            A = torch.zeros((M, K), dtype=torch.int8).to(A_in_dtype).cuda()
-        elif A_in_dtype in {torch.float8_e4m3fn, torch.float8_e5m2}:
-            A = torch.zeros(M, K).to(A_in_dtype).cuda()
+        if A_torch in {torch.int8, torch.int32}:
+            A = torch.zeros((M, K), dtype=torch.int8).to(A_torch).cuda()
+        elif A_torch in {torch.float8_e4m3fn, torch.float8_e5m2}:
+            A = torch.zeros(M, K).to(A_torch).cuda()
         else:
-            A = torch.zeros(M, K).to(A_in_dtype).cuda() - 0.5
-        if B_in_dtype in {torch.int8, torch.int32}:
-            B = torch.zeros((N, K), dtype=torch.int8).to(B_in_dtype).cuda()
-        elif B_in_dtype in {torch.float8_e4m3fn, torch.float8_e5m2}:
-            B = torch.zeros(N, K).to(B_in_dtype).cuda()
+            A = torch.zeros(M, K).to(A_torch).cuda() - 0.5
+        if B_torch in {torch.int8, torch.int32}:
+            B = torch.zeros((N, K), dtype=torch.int8).to(B_torch).cuda()
+        elif B_torch in {torch.float8_e4m3fn, torch.float8_e5m2}:
+            B = torch.zeros(N, K).to(B_torch).cuda()
         else:
-            B = torch.zeros(N, K).to(B_in_dtype).cuda() - 0.5
+            B = torch.zeros(N, K).to(B_torch).cuda() - 0.5
     else:
-        if A_in_dtype in {torch.int8, torch.int32}:
-            A = torch.randint(-128, 128, (M, K), dtype=torch.int8).to(A_in_dtype).cuda()
-        elif A_in_dtype in {torch.float8_e4m3fn, torch.float8_e5m2}:
-            A = torch.randn(M, K).to(A_in_dtype).cuda()
+        if A_torch in {torch.int8, torch.int32}:
+            A = torch.randint(-128, 128, (M, K), dtype=torch.int8).to(A_torch).cuda()
+        elif A_torch in {torch.float8_e4m3fn, torch.float8_e5m2}:
+            A = torch.randn(M, K).to(A_torch).cuda()
         else:
-            A = torch.randn(M, K).to(A_in_dtype).cuda() - 0.5
-        if B_in_dtype in {torch.int8, torch.int32}:
-            B = torch.randint(-128, 128, (N, K), dtype=torch.int8).to(B_in_dtype).cuda()
-        elif B_in_dtype in {torch.float8_e4m3fn, torch.float8_e5m2}:
-            B = torch.randn(N, K).to(B_in_dtype).cuda()
+            A = torch.randn(M, K).to(A_torch).cuda() - 0.5
+        if B_torch in {torch.int8, torch.int32}:
+            B = torch.randint(-128, 128, (N, K), dtype=torch.int8).to(B_torch).cuda()
+        elif B_torch in {torch.float8_e4m3fn, torch.float8_e5m2}:
+            B = torch.randn(N, K).to(B_torch).cuda()
         else:
-            B = torch.randn(N, K).to(B_in_dtype).cuda() - 0.5
+            B = torch.randn(N, K).to(B_torch).cuda() - 0.5
 
     C = kernel(A, B)
-    
+
     if tracekernel:
         return
-
-    # # Get Reference Result
-    # if in_dtype == torch.int8:
-    #     ref_c = torch._int_mm(A, B.T)
-    # else:
-    #     ref_c = torch.matmul(A.to(torch.float32), B.T.to(torch.float32)).to(out_dtype)
-    # # torch.testing.assert_close(C, ref_c, rtol=1e-2, atol=1e-2)
-    # # tilelang.testing.torch_assert_close(C, ref_c, rtol=1e-2, atol=1e-2)
-    # print("All check passed.")
 
     # benchmark
     if use_zero_benchmark:
@@ -109,9 +104,9 @@ def main(
     else:
         profiler = kernel.get_profiler(tensor_supply_type=tilelang.TensorSupplyType.Randn)
     latency = profiler.do_bench(backend="cupti", n_warmup=20, n_repeat=200)
-    print(f"tilelang Latency: {latency}ms")
     total_flops = 2 * M * N * K
-    print(f"tilelang TFlops (or Tops): {total_flops / latency * 1e-9} TFlops")
+    unit = "TFlops" if dtype == "float16" else "TOPS"
+    print(f"tilelang: {latency:.4f} ms, {total_flops / latency * 1e-9:.1f} {unit}")
 
     # benchmark torch (CUPTI via torch.profiler)
     def cupti_bench_torch(func, n_warmup=20, n_repeat=200):
@@ -130,30 +125,26 @@ def main(
         return cuda_us / n_repeat / 1000  # us -> ms
 
     B_T = B.T
-    if A_in_dtype == torch.int8:
+    if A_torch == torch.int8:
         latency = cupti_bench_torch(lambda: torch._int_mm(A, B_T))
     else:
         latency = cupti_bench_torch(lambda: torch.matmul(A, B_T))
-    print(f"torch Latency: {latency}ms")
-    print(f"torch TFlops (or Tops): {total_flops / latency * 1e-9} TFlops")
+    print(f"torch:    {latency:.4f} ms, {total_flops / latency * 1e-9:.1f} {unit}")
 
 
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="Baseline intrinsic GEMM benchmark")
     parser.add_argument("--M", type=int, default=8192)
     parser.add_argument("--N", type=int, default=8192)
     parser.add_argument("--K", type=int, default=4096)
+    parser.add_argument("--dtype", type=str, default="int8", choices=["float16", "int8"])
     parser.add_argument("--warp_m", type=int, default=64)
     parser.add_argument("--warp_n", type=int, default=64)
     parser.add_argument("--chunk", type=int, default=64)
     parser.add_argument("--block_m", type=int, default=128)
     parser.add_argument("--block_n", type=int, default=128)
-    parser.add_argument("--Atype", type=str, default="int8")
-    parser.add_argument("--Wtype", type=str, default="int8")
-    parser.add_argument("--Outtype", type=str, default="int32")
-    parser.add_argument("--acctype", type=str, default="int32")
     parser.add_argument("--stage", type=int, default=3)
     parser.add_argument("--tracekernel", type=str_to_bool, nargs='?',
                         const=True, default=False)
@@ -161,7 +152,7 @@ if __name__ == "__main__":
                         const=True, default=False)
 
     args = parser.parse_args()
-    
+
     main(
         M=args.M,
         N=args.N,
@@ -171,10 +162,7 @@ if __name__ == "__main__":
         chunk=args.chunk,
         block_row_tiles=args.block_m,
         block_col_tiles=args.block_n,
-        A_in_dtype=args.Atype,
-        B_in_dtype=args.Wtype,
-        C_in_dtype=args.acctype,
-        C_out_dtype=args.Outtype,
+        dtype=args.dtype,
         stage=args.stage,
         tracekernel=args.tracekernel,
         use_shmem_writeback=args.use_shmem_writeback,
