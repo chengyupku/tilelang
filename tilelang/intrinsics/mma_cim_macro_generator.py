@@ -199,15 +199,20 @@ class CIMTensorCoreIntrinEmitter(_BaseTensorCoreIntrinEmitter):
     # ldmatrix overrides (simplified buffer access, no BufferRegion)
     # ------------------------------------------------------------------
 
-    def ldmatrix_a(self, A_local_buf: Buffer, A_shared_buf: Buffer,
+    def ldmatrix_a(self, A_local_buf: Buffer, A_shared_buf,
                    ki: PrimExpr, rk: PrimExpr | None = 0,
                    a_local_offset: int = 0):
         """Load A from shared into local fragment.
 
         Args:
-            a_local_offset: byte-element offset into A_local_buf for this load.
+            A_shared_buf: Buffer or BufferRegion for shared A data.
+            a_local_offset: element offset into A_local_buf for this load.
                 Used when loading multiple mma_k sub-slices to fill A_local.
         """
+        # Handle BufferRegion (from T.gemm) — extract the underlying Buffer
+        from tvm.tir import BufferRegion
+        if isinstance(A_shared_buf, BufferRegion):
+            A_shared_buf = A_shared_buf.buffer
         warp_row_tiles = self.warp_row_tiles
         warp_rows = self.warp_rows
         chunk = self.chunk
@@ -360,21 +365,20 @@ class CIMTensorCoreIntrinEmitter(_BaseTensorCoreIntrinEmitter):
         def _warp_mma(A_local_buf, B_local_buf, C_local_buf):
             for j, i in T.grid(warp_cols, warp_rows):
                 if use_cim_stride:
-                    # CIM stride: index by micro_m*micro_k/32 per iteration
                     a_off = a_local_stride + i * local_size_a_cim
                     c_off = i * warp_cols * local_size_out_cim + j * local_size_out_cim
                 else:
-                    # HW cycling: cycle through hardware MMA positions
                     i_hw = i % hw_warp_rows
                     j_hw = (i // hw_warp_rows + j) % hw_warp_cols
                     a_off = a_local_stride + i_hw * local_size_a_hw
                     c_off = i_hw * hw_warp_cols * local_size_out_hw + j_hw * local_size_out_hw
+                b_off = b_local_stride + (j if use_cim_stride else j_hw) * local_size_b
                 T.ptx_mma(
                     accum_dtype, mma_prefix, "row", "col",
                     a_dtype_abbrv, b_dtype_abbrv, accum_dtype_abbrv,
                     A_local_buf.data, a_off,
                     B_local_buf.access_ptr(1, offset=offset),
-                    b_local_stride + (j if use_cim_stride else j_hw) * local_size_b,
+                    b_off,
                     C_local_buf.data, c_off,
                     T.bool(False), None, cim_simulate,
                 )
@@ -384,8 +388,7 @@ class CIMTensorCoreIntrinEmitter(_BaseTensorCoreIntrinEmitter):
                         a_dtype_abbrv, b_dtype_abbrv, accum_dtype_abbrv,
                         A_local_buf.data, a_off,
                         B_local_buf.data,
-                        b_local_stride + (j if use_cim_stride else j_hw) * local_size_b
-                        + lift(local_size_b) // 2,
+                        b_off + lift(local_size_b) // 2,
                         C_local_buf.data, c_off + lift(local_size_out_hw) // 2,
                         T.bool(False), None, cim_simulate,
                     )

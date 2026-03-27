@@ -128,6 +128,22 @@ class GemmBase:
         return getattr(self.gemm_node, "mbarPtr", tvm.tir.const(0, T.uint32))
 
     @property
+    def cim_simulate(self) -> bool:
+        return bool(getattr(self.gemm_node, "cimSimulate", False))
+
+    @property
+    def cim_micro_m(self) -> int:
+        return int(getattr(self.gemm_node, "cimMicroM", 0))
+
+    @property
+    def cim_micro_n(self) -> int:
+        return int(getattr(self.gemm_node, "cimMicroN", 0))
+
+    @property
+    def cim_micro_k(self) -> int:
+        return int(getattr(self.gemm_node, "cimMicroK", 0))
+
+    @property
     def mbar(self) -> tir.BufferLoad | None:
         return getattr(self.gemm_node, "mbar", None)
 

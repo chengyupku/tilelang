@@ -40,9 +40,10 @@ data_map = {
 def make_swizzle_layout(shared_buf):
     dtype = shared_buf.dtype
     shape = shared_buf.shape
-
-    can_swizzle = shape[-1] * DataType(dtype).bits == 512
-    if not can_swizzle:
+    from tvm import DataType
+    row_bits = shape[-1] * DataType(dtype).bits
+    # Swizzle when row is at least 512 bits (64 bytes)
+    if row_bits < 512:
         return T.Layout(shape, lambda *args: args)
 
     def transform_func(i, j):

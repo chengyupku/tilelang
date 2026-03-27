@@ -31,6 +31,10 @@ def _gemm_impl(
     k_pack: int = 1,
     wg_wait: int = 0,
     mbar: BarrierType | None = None,
+    cim_simulate: bool = False,
+    cim_micro_m: int = 0,
+    cim_micro_n: int = 0,
+    cim_micro_k: int = 0,
 ) -> tir.PrimExpr:
     """Shared GEMM implementation.
 
@@ -132,6 +136,10 @@ def _gemm_impl(
         mbar_arg,
         C_coords[0],
         C_coords[1],
+        cim_simulate,
+        cim_micro_m,
+        cim_micro_n,
+        cim_micro_k,
     )
 
 
@@ -147,6 +155,10 @@ def gemm_v1(
     k_pack: int = 1,
     wg_wait: int = 0,
     mbar: BarrierType | None = None,
+    cim_simulate: bool = False,
+    cim_micro_m: int = 0,
+    cim_micro_n: int = 0,
+    cim_micro_k: int = 0,
 ) -> tir.PrimExpr:
     """GEMM v1: use op tl.gemm."""
     return _gemm_impl(
@@ -161,6 +173,8 @@ def gemm_v1(
         k_pack,
         wg_wait,
         mbar,
+        cim_simulate,
+        cim_micro_m, cim_micro_n, cim_micro_k,
     )
 
 
@@ -176,6 +190,10 @@ def gemm_v2(
     k_pack: int = 1,
     wg_wait: int = 0,
     mbar: BarrierType | None = None,
+    cim_simulate: bool = False,
+    cim_micro_m: int = 0,
+    cim_micro_n: int = 0,
+    cim_micro_k: int = 0,
 ) -> tir.PrimExpr:
     """GEMM v2: use op tl.gemm_py."""
     return _gemm_impl(
@@ -190,6 +208,8 @@ def gemm_v2(
         k_pack,
         wg_wait,
         mbar,
+        cim_simulate,
+        cim_micro_m, cim_micro_n, cim_micro_k,
     )
 
 
@@ -208,6 +228,10 @@ def gemm(
     k_pack: int = 1,
     wg_wait: int = 0,
     mbar: BarrierType | None = None,
+    cim_simulate: bool = False,
+    cim_micro_m: int = 0,
+    cim_micro_n: int = 0,
+    cim_micro_k: int = 0,
 ) -> tir.PrimExpr:
     """TileLang GEMM operator.
 
@@ -222,10 +246,15 @@ def gemm(
         k_pack (int): Numbers of packed matrix cores, for ROCm only. Defaults to 1.
         wg_wait (int): Int identifier of the warpgroup MMA batch to wait on.. Defaults to 0.
         mbar (BarrierType, i.e. Buffer | BufferLoad, or Var, optional): Mbarrier in Blackwell. Defaults to None.
+        cim_simulate (bool): If True, skip B data load and use CIM address hook in MMA. Defaults to False.
+        cim_micro_m (int): CIM instruction M dimension. 0 = hardware MMA default.
+        cim_micro_n (int): CIM instruction N dimension. 0 = hardware MMA default.
+        cim_micro_k (int): CIM instruction K dimension. 0 = hardware MMA default.
 
     Returns:
         tir.Call: A handle to the GEMM operation.
     """
 
     impl = gemm_v1 if _env.use_gemm_v1() else gemm_v2
-    return impl(A, B, C, transpose_A, transpose_B, policy, clear_accum, k_pack, wg_wait, mbar)
+    return impl(A, B, C, transpose_A, transpose_B, policy, clear_accum, k_pack, wg_wait, mbar,
+                cim_simulate, cim_micro_m, cim_micro_n, cim_micro_k)

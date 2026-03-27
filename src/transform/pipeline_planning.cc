@@ -615,11 +615,11 @@ private:
     // Stage 1. Create pipeline stages and assign order
     for (auto &pinfo : pipeline_stage_infos) {
       // Skip elements that must be in first stage:
-      // 1. Copy stages (with active last_use_stmt_index) - these need special
-      // handling
-      //    because they have consumers that depend on their data
+      // 1. Copy stages - always go to stage 0 for async prefetch eligibility,
+      //    even if no consumer is found (e.g., CIM simulation skips ldmatrix_b
+      //    but B still needs to be copied to shared memory via cp_async).
       // 2. All Producer stages for copy stages.
-      if (pinfo.is_first_stage() && pinfo.is_last_use_stmt_index_valid()) {
+      if (pinfo.is_first_stage()) {
         continue;
       }
 
@@ -638,6 +638,17 @@ private:
           pinfo_1.order = order_idx++;
           pinfo_1.stage = 0; // Copy stages are typically assigned to stage 0
         }
+      }
+    }
+
+    // Assign remaining first-stage elements (copy/producer stages without
+    // a detected consumer) to stage 0.  This ensures global→shared copies
+    // still go through cp_async even when the shared buffer has no consumer
+    // in the compute phase (e.g., CIM simulation skips ldmatrix_b).
+    for (auto &pinfo : pipeline_stage_infos) {
+      if (pinfo.is_first_stage() && pinfo.stage == -1) {
+        pinfo.order = order_idx++;
+        pinfo.stage = 0;
       }
     }
 

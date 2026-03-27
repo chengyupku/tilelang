@@ -36,6 +36,10 @@ public:
   int kPack_ = 1;
   int wgWait_ = 0;
   mutable GemmWarpPolicy policy_;
+  bool cimSimulate_ = false;
+  int cimMicroM_ = 0;
+  int cimMicroN_ = 0;
+  int cimMicroK_ = 0;
 
   TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.GemmPy", GemmPyNode, TileOperatorNode);
 
@@ -62,7 +66,11 @@ public:
         .def_ro("cCoords", &GemmPyNode::cCoords_)
         .def_ro("kPack", &GemmPyNode::kPack_)
         .def_ro("wgWait", &GemmPyNode::wgWait_)
-        .def_ro("policy", &GemmPyNode::policy_);
+        .def_ro("policy", &GemmPyNode::policy_)
+        .def_ro("cimSimulate", &GemmPyNode::cimSimulate_)
+        .def_ro("cimMicroM", &GemmPyNode::cimMicroM_)
+        .def_ro("cimMicroN", &GemmPyNode::cimMicroN_)
+        .def_ro("cimMicroK", &GemmPyNode::cimMicroK_);
   }
 
   Stmt Lower(const LowerArgs &T, arith::Analyzer *analyzer) const override;

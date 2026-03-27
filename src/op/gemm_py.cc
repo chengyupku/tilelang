@@ -87,6 +87,28 @@ GemmPy::GemmPy(Array<PrimExpr> args, Map<String, ObjectRef> annotations) {
   }
   node->cCoords_ = Array<PrimExpr>(
       {args[17].as<PrimExpr>().value(), args[18].as<PrimExpr>().value()});
+  if (args.size() > 19) {
+    if (const auto *imm = args[19].as<IntImmNode>()) {
+      node->cimSimulate_ = (imm->value != 0);
+    } else if (auto b = args[19].as<Bool>()) {
+      node->cimSimulate_ = b.value();
+    }
+  }
+  if (args.size() > 20) {
+    if (const auto *imm = args[20].as<IntImmNode>()) {
+      node->cimMicroM_ = imm->value;
+    }
+  }
+  if (args.size() > 21) {
+    if (const auto *imm = args[21].as<IntImmNode>()) {
+      node->cimMicroN_ = imm->value;
+    }
+  }
+  if (args.size() > 22) {
+    if (const auto *imm = args[22].as<IntImmNode>()) {
+      node->cimMicroK_ = imm->value;
+    }
+  }
   data_ = std::move(node);
 }
 

@@ -68,18 +68,9 @@ tilelang.disable_cache()
 
 
 def make_swizzle_layout(shared_buf):
-    dtype = shared_buf.dtype
-    shape = shared_buf.shape
-
-    can_swizzle = shape[-1] * DataType(dtype).bits == 512
-    if not can_swizzle:
-        return T.Layout(shape, lambda *args: args)
-
-    def transform_func(i, j):
-        new_warp_i, new_warp_j = get_swizzle_layout(i, j, shape[-1], dtype)
-        return [new_warp_i, new_warp_j]
-
-    return T.Layout(shape, transform_func)
+    """Use TileLang's auto swizzle layout — handles any row width."""
+    from tilelang.layout import make_swizzled_layout
+    return make_swizzled_layout(shared_buf)
 
 
 @tilelang.jit(out_idx=[2])
