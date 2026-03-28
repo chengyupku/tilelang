@@ -2,9 +2,6 @@
 CIM-simulated Flash Attention (BSHD layout) using T.gemm(cim_simulate=True)
 with micro_m/n/k ratio control.
 
-cim_simulate=True automatically uses gemm_v1 (C++ lowering with CuTE template).
-The generated CUDA code is identical to baseline minus B ldmatrix instructions,
-with optional A-load frequency and M×N grouping control via micro ratios.
 Results are numerically incorrect — this is a latency-only CIM benchmark.
 """
 import torch
@@ -13,6 +10,118 @@ import tilelang.language as T
 import argparse
 
 tilelang.disable_cache()
+
+DTYPE_BYTES = {"float16": 2, "int8": 1}
+
+
+def _query_kernel_resources(kernel, threads_per_block, dyn_shmem):
+    """Query actual register count and occupancy via CUDA Driver API."""
+    import ctypes, tempfile, os, re
+    try:
+        torch.zeros(1, device='cuda')
+        dev_mod = kernel.artifact.rt_mod.imports_[0]
+        cubin_path = os.path.join(tempfile.gettempdir(), '_tilelang_query.cubin')
+        dev_mod.write_to_file(cubin_path, fmt='cubin')
+
+        tir_src = str(kernel.artifact.device_mod)
+        m = re.search(r'def (\w+_kernel)\(', tir_src)
+        func_name = m.group(1).encode() if m else b'kernel_kernel'
+
+        cuda = ctypes.CDLL('libcuda.so.1')
+        CUmodule = ctypes.c_void_p
+        CUfunction = ctypes.c_void_p
+
+        module = CUmodule()
+        if cuda.cuModuleLoad(ctypes.byref(module), cubin_path.encode()) != 0:
+            return None, None
+        func = CUfunction()
+        if cuda.cuModuleGetFunction(ctypes.byref(func), module, func_name) != 0:
+            cuda.cuModuleUnload(module)
+            return None, None
+
+        val = ctypes.c_int()
+        cuda.cuFuncGetAttribute(ctypes.byref(val), 4, func)
+        regs = val.value
+
+        cuda.cuFuncSetAttribute(func, 8, dyn_shmem)
+        num_blocks = ctypes.c_int()
+        cuda.cuOccupancyMaxActiveBlocksPerMultiprocessor(
+            ctypes.byref(num_blocks), func, threads_per_block, ctypes.c_size_t(dyn_shmem))
+        occ = num_blocks.value
+
+        cuda.cuModuleUnload(module)
+        os.unlink(cubin_path)
+        return regs, occ
+    except Exception:
+        return None, None
+
+
+def report_cim_capacity(cim_buffers, num_stages, kernel, threads_per_block):
+    """Report CIM macro capacity at multiple levels."""
+    import re
+    props = torch.cuda.get_device_properties(0)
+
+    actual_shmem = 0
+    try:
+        tir_src = str(kernel.artifact.device_mod)
+        m = re.search(r'"dyn_shared_memory_buf":\s*(\d+)', tir_src)
+        if m:
+            actual_shmem = int(m.group(1))
+    except Exception:
+        pass
+
+    regs_per_thread, max_cta = _query_kernel_resources(kernel, threads_per_block, actual_shmem)
+
+    n_bufs = len(cim_buffers)
+    n_sm = props.multi_processor_count
+
+    print("\n=== CIM Macro Capacity Report ===")
+
+    print(f"  [Block Tile]  {n_bufs} CIM buffer(s) per tile:")
+    cim_per_tile = 0
+    for name, shape, dtype in cim_buffers:
+        elem_bytes = DTYPE_BYTES[dtype]
+        n_elems = 1
+        for d in shape:
+            n_elems *= d
+        buf_bytes = n_elems * elem_bytes
+        cim_per_tile += buf_bytes
+        shape_str = "x".join(str(d) for d in shape)
+        print(f"    {name:12s}  {shape_str:>12s} x {dtype:>7s} = {buf_bytes:>8d} B ({buf_bytes/1024:.1f} KB)")
+    print(f"    {'':12s}  {'tile total':>12s}           = {cim_per_tile:>8d} B ({cim_per_tile/1024:.1f} KB)")
+
+    cim_per_cta = cim_per_tile * num_stages
+    print(f"  [Per CTA]     {n_bufs} tile(s) x {num_stages} stage(s) = {cim_per_cta/1024:.1f} KB CIM")
+    print(f"                total shmem (CIM + non-CIM) = {actual_shmem/1024:.1f} KB")
+
+    shmem_per_sm = props.shared_memory_per_multiprocessor
+    max_threads_per_sm = props.max_threads_per_multi_processor
+    regs_per_sm = props.regs_per_multiprocessor
+    warps_per_cta = threads_per_block // props.warp_size
+    max_warps_per_sm = max_threads_per_sm // props.warp_size
+
+    max_cta_by_shmem = shmem_per_sm // actual_shmem if actual_shmem > 0 else 99
+    max_cta_by_warps = max_warps_per_sm // warps_per_cta if warps_per_cta > 0 else 99
+    if regs_per_thread is not None and regs_per_thread > 0:
+        regs_per_cta = regs_per_thread * threads_per_block
+        max_cta_by_regs = regs_per_sm // regs_per_cta
+    else:
+        regs_per_cta = None
+        max_cta_by_regs = 99
+
+    print(f"  [Per SM]      SM resources vs CTA demand → max concurrent CTAs:")
+    print(f"    shmem:      {shmem_per_sm/1024:.0f} KB / {actual_shmem/1024:.1f} KB per CTA = {max_cta_by_shmem} CTAs")
+    print(f"    warps:      {max_warps_per_sm} / {warps_per_cta} per CTA = {max_cta_by_warps} CTAs")
+    if regs_per_thread is not None:
+        print(f"    registers:  {regs_per_sm} / ({regs_per_thread} x {threads_per_block}) per CTA = {max_cta_by_regs} CTAs")
+    if max_cta is not None:
+        print(f"    → {max_cta} concurrent CTA(s) (cuOccupancy)")
+        cim_per_sm = cim_per_cta * max_cta
+        print(f"    → CIM capacity = {max_cta} x {cim_per_cta/1024:.1f} KB = {cim_per_sm/1024:.1f} KB")
+
+        cim_total = cim_per_sm * n_sm
+        print(f"  [Device]      {n_sm} SMs x {cim_per_sm/1024:.1f} KB = {cim_total/1024/1024:.1f} MB CIM total")
+    print()
 
 
 @tilelang.jit(
@@ -127,6 +236,18 @@ def main(
     kernel = flashattn_cim(batch, heads, seq_len, dim, is_causal,
                            block_M=block_M, block_N=block_N, num_stages=num_stages, threads=threads,
                            micro_m=micro_m, micro_n=micro_n, micro_k=micro_k)
+
+    # CIM capacity report: K and V matrices live in CIM
+    report_cim_capacity(
+        cim_buffers=[
+            ("K_shared", (block_N, dim), "float16"),
+            ("V_shared", (block_N, dim), "float16"),
+        ],
+        num_stages=num_stages,
+        kernel=kernel,
+        threads_per_block=threads,
+    )
+
     profiler = kernel.get_profiler()
     latency = profiler.do_bench(backend="cupti", n_warmup=50, n_repeat=200)
     micro_str = f"micro={micro_m}/{micro_n}/{micro_k}" if any([micro_m, micro_n, micro_k]) else "micro=default"
