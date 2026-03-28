@@ -1,26 +1,12 @@
-'''
-  FA 的维度：
-  Q: [batch, seq_len_q, heads, dim]    — query
-  K: [batch, seq_len_kv, heads, dim]   — key
-  V: [batch, seq_len_kv, heads, dim]   — value
+"""Flash Attention BSHD with K/V sharing one shared memory buffer.
 
-  MMA0: Q × K^T = [seq_len_q, dim] × [dim, seq_len_kv] → [seq_len_q, seq_len_kv]
-                                       ^^^^ reduction = dim (head dimension)
+Identical to example_mha_fwd_bshd_baseline.py except:
+  - K_shared and V_shared merged into a single KV_shared buffer
+  - T.Pipelined replaced with T.serial (K/V sharing is incompatible with
+    pipeline prefetch — V must wait for K to be consumed before overwriting)
 
-  MMA1: S × V   = [seq_len_q, seq_len_kv] × [seq_len_kv, dim] → [seq_len_q, dim]
-                                ^^^^ reduction = seq_len_kv
-
-  Tiling：
-  - block_M = 128：Q 的序列方向分块（grid 维度）
-  - block_N = 128：KV 的序列方向分块（pipeline 迭代维度）
-  - dim = 128：head dimension，没有分块，每次完整加载
-
-  Pipeline 循环：
-  for k in T.Pipelined(seq_len_kv / block_N):  # 遍历 KV 序列方向
-      load K[block_N, dim]   # 128 个 KV token，每个 dim=128 维
-      load V[block_N, dim]
-'''
-
+This halves the KV shared memory footprint (one buffer instead of two).
+"""
 import torch
 import torch.nn.functional as F
 import tilelang
@@ -60,8 +46,7 @@ def flashattn(batch, heads, seq_len, dim, is_causal,
     ):
         with T.Kernel(T.ceildiv(seq_len, block_M), heads, batch, threads=threads) as (bx, by, bz):
             Q_shared = T.alloc_shared([block_M, dim], dtype)
-            K_shared = T.alloc_shared([block_N, dim], dtype)
-            V_shared = T.alloc_shared([block_N, dim], dtype)
+            KV_shared = T.alloc_shared([block_N, dim], dtype)  # shared for K and V
             O_shared = T.alloc_shared([block_M, dim], dtype)
             acc_s = T.alloc_fragment([block_M, block_N], accum_dtype)
             acc_s_cast = T.alloc_fragment([block_M, block_N], dtype)
@@ -82,8 +67,8 @@ def flashattn(batch, heads, seq_len, dim, is_causal,
                 if is_causal else T.ceildiv(seq_len, block_N)
             )
 
-            for k in T.Pipelined(loop_range, num_stages=num_stages):
-                T.copy(K[bz, k * block_N : (k + 1) * block_N, by, :], K_shared)
+            for k in T.serial(loop_range):  # serial: K/V share one buffer
+                T.copy(K[bz, k * block_N : (k + 1) * block_N, by, :], KV_shared)
                 if is_causal:
                     for i, j in T.Parallel(block_M, block_N):
                         acc_s[i, j] = T.if_then_else(
@@ -92,7 +77,7 @@ def flashattn(batch, heads, seq_len, dim, is_causal,
                     for i, j in T.Parallel(block_M, block_N):
                         acc_s[i, j] = T.if_then_else(
                             k * block_N + j >= seq_len, -T.infinity(acc_s.dtype), 0)
-                T.gemm(Q_shared, K_shared, acc_s, transpose_B=True,
+                T.gemm(Q_shared, KV_shared, acc_s, transpose_B=True,
                        policy=T.GemmWarpPolicy.FullRow)
 
                 T.copy(scores_max, scores_max_prev)
@@ -112,8 +97,8 @@ def flashattn(batch, heads, seq_len, dim, is_causal,
                 for i, j in T.Parallel(block_M, dim):
                     acc_o[i, j] *= scores_scale[i]
 
-                T.copy(V[bz, k * block_N : (k + 1) * block_N, by, :], V_shared)
-                T.gemm(acc_s_cast, V_shared, acc_o, policy=T.GemmWarpPolicy.FullRow)
+                T.copy(V[bz, k * block_N : (k + 1) * block_N, by, :], KV_shared)
+                T.gemm(acc_s_cast, KV_shared, acc_o, policy=T.GemmWarpPolicy.FullRow)
 
             for i, j in T.Parallel(block_M, dim):
                 acc_o[i, j] /= logsum[i]
@@ -121,72 +106,6 @@ def flashattn(batch, heads, seq_len, dim, is_causal,
             T.copy(O_shared, Output[bz, bx * block_M : (bx + 1) * block_M, by, :])
 
     return main
-
-
-def report_kernel_resources(kernel, threads_per_block):
-    """Report kernel resource usage and occupancy."""
-    import ctypes, tempfile, os, re
-    props = torch.cuda.get_device_properties(0)
-
-    # shmem from TIR
-    actual_shmem = 0
-    try:
-        tir_src = str(kernel.artifact.device_mod)
-        m = re.search(r'"dyn_shared_memory_buf":\s*(\d+)', tir_src)
-        if m:
-            actual_shmem = int(m.group(1))
-    except Exception:
-        pass
-
-    # regs + occupancy from CUDA driver API
-    regs_per_thread, max_cta = None, None
-    try:
-        torch.zeros(1, device='cuda')
-        dev_mod = kernel.artifact.rt_mod.imports_[0]
-        cubin_path = os.path.join(tempfile.gettempdir(), '_tilelang_query.cubin')
-        dev_mod.write_to_file(cubin_path, fmt='cubin')
-        tir_src = str(kernel.artifact.device_mod)
-        m = re.search(r'def (\w+_kernel)\(', tir_src)
-        func_name = m.group(1).encode() if m else b'main_kernel'
-        cuda = ctypes.CDLL('libcuda.so.1')
-        module = ctypes.c_void_p()
-        if cuda.cuModuleLoad(ctypes.byref(module), cubin_path.encode()) == 0:
-            func = ctypes.c_void_p()
-            if cuda.cuModuleGetFunction(ctypes.byref(func), module, func_name) == 0:
-                val = ctypes.c_int()
-                cuda.cuFuncGetAttribute(ctypes.byref(val), 4, func)
-                regs_per_thread = val.value
-                cuda.cuFuncSetAttribute(func, 8, actual_shmem)
-                num_blocks = ctypes.c_int()
-                cuda.cuOccupancyMaxActiveBlocksPerMultiprocessor(
-                    ctypes.byref(num_blocks), func, threads_per_block, ctypes.c_size_t(actual_shmem))
-                max_cta = num_blocks.value
-            cuda.cuModuleUnload(module)
-        os.unlink(cubin_path)
-    except Exception:
-        pass
-
-    shmem_per_sm = props.shared_memory_per_multiprocessor
-    regs_per_sm = props.regs_per_multiprocessor
-    max_warps_per_sm = props.max_threads_per_multi_processor // props.warp_size
-    warps_per_cta = threads_per_block // props.warp_size
-
-    print("\n=== Kernel Resource Report ===")
-    print(f"  shmem per CTA:    {actual_shmem/1024:.1f} KB")
-    print(f"  warps per CTA:    {warps_per_cta}")
-    if regs_per_thread is not None:
-        print(f"  regs per thread:  {regs_per_thread}")
-    print(f"  SM resources vs CTA demand:")
-    max_cta_by_shmem = shmem_per_sm // actual_shmem if actual_shmem > 0 else 99
-    max_cta_by_warps = max_warps_per_sm // warps_per_cta
-    print(f"    shmem:     {shmem_per_sm/1024:.0f} KB / {actual_shmem/1024:.1f} KB = {max_cta_by_shmem} CTAs")
-    print(f"    warps:     {max_warps_per_sm} / {warps_per_cta} = {max_cta_by_warps} CTAs")
-    if regs_per_thread is not None:
-        max_cta_by_regs = regs_per_sm // (regs_per_thread * threads_per_block)
-        print(f"    registers: {regs_per_sm} / ({regs_per_thread} x {threads_per_block}) = {max_cta_by_regs} CTAs")
-    if max_cta is not None:
-        print(f"    -> {max_cta} concurrent CTA(s) per SM (cuOccupancy)")
-    print()
 
 
 def ref_program(Q, K, V, is_causal):
@@ -212,7 +131,6 @@ def main(
     tune: bool = False,
     block_M: int = 128,
     block_N: int = 128,
-    num_stages: int = 1,
     threads: int = 256,
 ):
     flops_per_matmul = 2.0 * batch * heads * seq_len * seq_len * dim
@@ -222,8 +140,7 @@ def main(
 
     if not tune:
         kernel = flashattn(batch, heads, seq_len, dim, is_causal,
-                           block_M=block_M, block_N=block_N, num_stages=num_stages, threads=threads)
-        report_kernel_resources(kernel, threads)
+                           block_M=block_M, block_N=block_N, num_stages=1, threads=threads)
         ref_program_processed = partial(ref_program, is_causal=is_causal)
         profiler = kernel.get_profiler()
         profiler.assert_allclose(ref_program_processed, rtol=0.01, atol=0.01)
@@ -245,12 +162,6 @@ def main(
         print(f"Ref latency: {ref_latency}")
 
 
-def run_regression_perf(batch: int = 8, heads: int = 32, seq_len: int = 4096, dim: int = 128, is_causal: bool = False):
-    kernel = flashattn(batch, heads, seq_len, dim, is_causal, block_M=128, block_N=128, num_stages=1, threads=128)
-    profiler = kernel.get_profiler()
-    return profiler.do_bench(backend="cupti", n_warmup=50, n_repeat=200)
-
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--batch", type=int, default=8, help="batch size")
@@ -261,8 +172,7 @@ if __name__ == "__main__":
     parser.add_argument("--tune", action="store_true", help="tune configs")
     parser.add_argument("--block_M", type=int, default=128)
     parser.add_argument("--block_N", type=int, default=128)
-    parser.add_argument("--num_stages", type=int, default=2)
     parser.add_argument("--threads", type=int, default=256)
     args = parser.parse_args()
     main(args.batch, args.heads, args.seq_len, args.dim, args.is_causal, args.tune,
-         args.block_M, args.block_N, args.num_stages, args.threads)
+         args.block_M, args.block_N, args.threads)
