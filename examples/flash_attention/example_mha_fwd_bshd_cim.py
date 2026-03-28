@@ -114,6 +114,10 @@ def main(
     micro_m: int = 0,
     micro_n: int = 0,
     micro_k: int = 0,
+    block_M: int = 128,
+    block_N: int = 128,
+    num_stages: int = 1,
+    threads: int = 256,
 ):
     flops_per_matmul = 2.0 * batch * heads * seq_len * seq_len * dim
     total_flops = 2 * flops_per_matmul
@@ -121,7 +125,7 @@ def main(
         total_flops *= 0.5
 
     kernel = flashattn_cim(batch, heads, seq_len, dim, is_causal,
-                           block_M=128, block_N=128, num_stages=1, threads=256,
+                           block_M=block_M, block_N=block_N, num_stages=num_stages, threads=threads,
                            micro_m=micro_m, micro_n=micro_n, micro_k=micro_k)
     profiler = kernel.get_profiler()
     latency = profiler.do_bench(backend="cupti", n_warmup=50, n_repeat=200)
@@ -140,6 +144,11 @@ if __name__ == "__main__":
     parser.add_argument("--micro_m", type=int, default=0, help="CIM instruction M dim (0=default)")
     parser.add_argument("--micro_n", type=int, default=0, help="CIM instruction N dim (0=default)")
     parser.add_argument("--micro_k", type=int, default=0, help="CIM instruction K dim (0=default)")
+    parser.add_argument("--block_M", type=int, default=128)
+    parser.add_argument("--block_N", type=int, default=128)
+    parser.add_argument("--num_stages", type=int, default=2)
+    parser.add_argument("--threads", type=int, default=256)
     args = parser.parse_args()
     main(args.batch, args.heads, args.seq_len, args.dim, args.is_causal,
-         args.micro_m, args.micro_n, args.micro_k)
+         args.micro_m, args.micro_n, args.micro_k,
+         args.block_M, args.block_N, args.num_stages, args.threads)

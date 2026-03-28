@@ -121,6 +121,10 @@ def main(
     dim: int = 128,
     is_causal: bool = False,
     tune: bool = False,
+    block_M: int = 128,
+    block_N: int = 128,
+    num_stages: int = 1,
+    threads: int = 256,
 ):
     flops_per_matmul = 2.0 * batch * heads * seq_len * seq_len * dim
     total_flops = 2 * flops_per_matmul
@@ -129,7 +133,7 @@ def main(
 
     if not tune:
         kernel = flashattn(batch, heads, seq_len, dim, is_causal,
-                           block_M=128, block_N=128, num_stages=1, threads=256)
+                           block_M=block_M, block_N=block_N, num_stages=num_stages, threads=threads)
         ref_program_processed = partial(ref_program, is_causal=is_causal)
         profiler = kernel.get_profiler()
         profiler.assert_allclose(ref_program_processed, rtol=0.01, atol=0.01)
@@ -165,5 +169,10 @@ if __name__ == "__main__":
     parser.add_argument("--dim", type=int, default=128, help="dim")
     parser.add_argument("--is_causal", action="store_true", help="causal")
     parser.add_argument("--tune", action="store_true", help="tune configs")
+    parser.add_argument("--block_M", type=int, default=128)
+    parser.add_argument("--block_N", type=int, default=128)
+    parser.add_argument("--num_stages", type=int, default=2)
+    parser.add_argument("--threads", type=int, default=256)
     args = parser.parse_args()
-    main(args.batch, args.heads, args.seq_len, args.dim, args.is_causal, args.tune)
+    main(args.batch, args.heads, args.seq_len, args.dim, args.is_causal, args.tune,
+         args.block_M, args.block_N, args.num_stages, args.threads)
