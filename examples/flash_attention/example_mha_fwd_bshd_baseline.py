@@ -29,6 +29,9 @@ import tilelang.language as T
 import itertools
 import argparse
 from functools import partial
+import os, sys
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from utils.kernel_report import report_kernel_resources
 
 tilelang.disable_cache()
 
@@ -121,72 +124,6 @@ def flashattn(batch, heads, seq_len, dim, is_causal,
             T.copy(O_shared, Output[bz, bx * block_M : (bx + 1) * block_M, by, :])
 
     return main
-
-
-def report_kernel_resources(kernel, threads_per_block):
-    """Report kernel resource usage and occupancy."""
-    import ctypes, tempfile, os, re
-    props = torch.cuda.get_device_properties(0)
-
-    # shmem from TIR
-    actual_shmem = 0
-    try:
-        tir_src = str(kernel.artifact.device_mod)
-        m = re.search(r'"dyn_shared_memory_buf":\s*(\d+)', tir_src)
-        if m:
-            actual_shmem = int(m.group(1))
-    except Exception:
-        pass
-
-    # regs + occupancy from CUDA driver API
-    regs_per_thread, max_cta = None, None
-    try:
-        torch.zeros(1, device='cuda')
-        dev_mod = kernel.artifact.rt_mod.imports_[0]
-        cubin_path = os.path.join(tempfile.gettempdir(), '_tilelang_query.cubin')
-        dev_mod.write_to_file(cubin_path, fmt='cubin')
-        tir_src = str(kernel.artifact.device_mod)
-        m = re.search(r'def (\w+_kernel)\(', tir_src)
-        func_name = m.group(1).encode() if m else b'main_kernel'
-        cuda = ctypes.CDLL('libcuda.so.1')
-        module = ctypes.c_void_p()
-        if cuda.cuModuleLoad(ctypes.byref(module), cubin_path.encode()) == 0:
-            func = ctypes.c_void_p()
-            if cuda.cuModuleGetFunction(ctypes.byref(func), module, func_name) == 0:
-                val = ctypes.c_int()
-                cuda.cuFuncGetAttribute(ctypes.byref(val), 4, func)
-                regs_per_thread = val.value
-                cuda.cuFuncSetAttribute(func, 8, actual_shmem)
-                num_blocks = ctypes.c_int()
-                cuda.cuOccupancyMaxActiveBlocksPerMultiprocessor(
-                    ctypes.byref(num_blocks), func, threads_per_block, ctypes.c_size_t(actual_shmem))
-                max_cta = num_blocks.value
-            cuda.cuModuleUnload(module)
-        os.unlink(cubin_path)
-    except Exception:
-        pass
-
-    shmem_per_sm = props.shared_memory_per_multiprocessor
-    regs_per_sm = props.regs_per_multiprocessor
-    max_warps_per_sm = props.max_threads_per_multi_processor // props.warp_size
-    warps_per_cta = threads_per_block // props.warp_size
-
-    print("\n=== Kernel Resource Report ===")
-    print(f"  shmem per CTA:    {actual_shmem/1024:.1f} KB")
-    print(f"  warps per CTA:    {warps_per_cta}")
-    if regs_per_thread is not None:
-        print(f"  regs per thread:  {regs_per_thread}")
-    print(f"  SM resources vs CTA demand:")
-    max_cta_by_shmem = shmem_per_sm // actual_shmem if actual_shmem > 0 else 99
-    max_cta_by_warps = max_warps_per_sm // warps_per_cta
-    print(f"    shmem:     {shmem_per_sm/1024:.0f} KB / {actual_shmem/1024:.1f} KB = {max_cta_by_shmem} CTAs")
-    print(f"    warps:     {max_warps_per_sm} / {warps_per_cta} = {max_cta_by_warps} CTAs")
-    if regs_per_thread is not None:
-        max_cta_by_regs = regs_per_sm // (regs_per_thread * threads_per_block)
-        print(f"    registers: {regs_per_sm} / ({regs_per_thread} x {threads_per_block}) = {max_cta_by_regs} CTAs")
-    if max_cta is not None:
-        print(f"    -> {max_cta} concurrent CTA(s) per SM (cuOccupancy)")
-    print()
 
 
 def ref_program(Q, K, V, is_causal):

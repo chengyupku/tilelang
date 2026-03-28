@@ -1,43 +1,53 @@
-"""
-CIM-simulated Flash Attention (BSHD layout) using T.gemm(cim_simulate=True)
-with micro_m/n/k ratio control.
+"""CIM Flash Attention BHSD with separate seq_q / seq_kv support.
 
+Based on example_mha_fwd_bhsd_baseline.py with cim_simulate=True on both T.gemm calls.
 Results are numerically incorrect — this is a latency-only CIM benchmark.
 """
 import torch
 import tilelang
+from tilelang.autotuner import *
 import tilelang.language as T
+import itertools
 import argparse
-
-tilelang.disable_cache()
-
 import os, sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from utils.kernel_report import report_cim_capacity
 
+tilelang.disable_cache()
 
+
+def get_configs():
+    iter_params = dict(block_M=[64], block_N=[64], num_stages=[1], threads=[128])
+    return [dict(zip(iter_params, values)) for values in itertools.product(*iter_params.values())]
+
+
+@autotune(configs=get_configs(), warmup=10, rep=10)
 @tilelang.jit(
     out_idx=[3],
     pass_configs={
         tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
     },
 )
-def flashattn_cim(batch, heads, seq_len, dim, is_causal,
+def flashattn_cim(batch, heads, seq_q, seq_kv, dim, is_causal,
                   block_M=128, block_N=128, num_stages=1, threads=256,
                   micro_m=0, micro_n=0, micro_k=0, cim_stride_index=False):
-    scale = (1.0 / dim) ** 0.5 * 1.44269504  # log2(e)
-    shape = [batch, seq_len, heads, dim]
+    scale = (1.0 / dim) ** 0.5 * 1.44269504
+    q_shape = [batch, heads, seq_q, dim]
+    kv_shape = [batch, heads, seq_kv, dim]
     dtype = T.float16
     accum_dtype = T.float32
 
+    past_len = seq_kv - seq_q
+    assert past_len >= 0, "seq_kv must be greater than or equal to seq_q"
+
     @T.prim_func
     def main(
-        Q: T.Tensor(shape, dtype),
-        K: T.Tensor(shape, dtype),
-        V: T.Tensor(shape, dtype),
-        Output: T.Tensor(shape, dtype),
+        Q: T.Tensor(q_shape, dtype),
+        K: T.Tensor(kv_shape, dtype),
+        V: T.Tensor(kv_shape, dtype),
+        Output: T.Tensor(q_shape, dtype),
     ):
-        with T.Kernel(T.ceildiv(seq_len, block_M), heads, batch, threads=threads) as (bx, by, bz):
+        with T.Kernel(T.ceildiv(seq_q, block_M), heads, batch, threads=threads) as (bx, by, bz):
             Q_shared = T.alloc_shared([block_M, dim], dtype)
             K_shared = T.alloc_shared([block_N, dim], dtype)
             V_shared = T.alloc_shared([block_N, dim], dtype)
@@ -51,26 +61,27 @@ def flashattn_cim(batch, heads, seq_len, dim, is_causal,
             scores_sum = T.alloc_fragment([block_M], accum_dtype)
             logsum = T.alloc_fragment([block_M], accum_dtype)
 
-            T.copy(Q[bz, bx * block_M : (bx + 1) * block_M, by, :], Q_shared)
+            T.copy(Q[bz, by, bx * block_M : (bx + 1) * block_M, :], Q_shared)
             T.fill(acc_o, 0)
             T.fill(logsum, 0)
             T.fill(scores_max, -T.infinity(accum_dtype))
 
             loop_range = (
-                T.min(T.ceildiv(seq_len, block_N), T.ceildiv((bx + 1) * block_M, block_N))
-                if is_causal else T.ceildiv(seq_len, block_N)
+                T.min(T.ceildiv(seq_kv, block_N), T.ceildiv((bx + 1) * block_M + past_len, block_N))
+                if is_causal
+                else T.ceildiv(seq_kv, block_N)
             )
 
             for k in T.Pipelined(loop_range, num_stages=num_stages):
-                T.copy(K[bz, k * block_N : (k + 1) * block_N, by, :], K_shared)
+                T.copy(K[bz, by, k * block_N : (k + 1) * block_N, :], K_shared)
                 if is_causal:
                     for i, j in T.Parallel(block_M, block_N):
-                        acc_s[i, j] = T.if_then_else(
-                            bx * block_M + i >= k * block_N + j, 0, -T.infinity(acc_s.dtype))
+                        q_idx = bx * block_M + i + past_len
+                        k_idx = k * block_N + j
+                        acc_s[i, j] = T.if_then_else(q_idx >= k_idx, 0, -T.infinity(acc_s.dtype))
                 else:
                     for i, j in T.Parallel(block_M, block_N):
-                        acc_s[i, j] = T.if_then_else(
-                            k * block_N + j >= seq_len, -T.infinity(acc_s.dtype), 0)
+                        acc_s[i, j] = T.if_then_else(k * block_N + j >= seq_kv, -T.infinity(acc_s.dtype), 0)
                 T.gemm(Q_shared, K_shared, acc_s, transpose_B=True,
                        policy=T.GemmWarpPolicy.FullRow,
                        cim_simulate=True,
@@ -94,8 +105,9 @@ def flashattn_cim(batch, heads, seq_len, dim, is_causal,
                 for i, j in T.Parallel(block_M, dim):
                     acc_o[i, j] *= scores_scale[i]
 
-                T.copy(V[bz, k * block_N : (k + 1) * block_N, by, :], V_shared)
-                T.gemm(acc_s_cast, V_shared, acc_o, policy=T.GemmWarpPolicy.FullRow,
+                T.copy(V[bz, by, k * block_N : (k + 1) * block_N, :], V_shared)
+                T.gemm(acc_s_cast, V_shared, acc_o,
+                       policy=T.GemmWarpPolicy.FullRow,
                        cim_simulate=True,
                        cim_micro_m=micro_m, cim_micro_n=micro_n, cim_micro_k=micro_k,
                        cim_stride_index=cim_stride_index)
@@ -103,7 +115,7 @@ def flashattn_cim(batch, heads, seq_len, dim, is_causal,
             for i, j in T.Parallel(block_M, dim):
                 acc_o[i, j] /= logsum[i]
             T.copy(acc_o, O_shared)
-            T.copy(O_shared, Output[bz, bx * block_M : (bx + 1) * block_M, by, :])
+            T.copy(O_shared, Output[bz, by, bx * block_M : (bx + 1) * block_M, :])
 
     return main
 
@@ -111,7 +123,8 @@ def flashattn_cim(batch, heads, seq_len, dim, is_causal,
 def main(
     batch: int = 8,
     heads: int = 32,
-    seq_len: int = 4096,
+    seq_q: int = 4096,
+    seq_kv: int = 4096,
     dim: int = 128,
     is_causal: bool = False,
     micro_m: int = 0,
@@ -120,20 +133,19 @@ def main(
     cim_stride_index: bool = False,
     block_M: int = 128,
     block_N: int = 128,
-    num_stages: int = 1,
+    num_stages: int = 2,
     threads: int = 256,
 ):
-    flops_per_matmul = 2.0 * batch * heads * seq_len * seq_len * dim
+    flops_per_matmul = 2.0 * batch * heads * seq_q * seq_kv * dim
     total_flops = 2 * flops_per_matmul
     if is_causal:
         total_flops *= 0.5
 
-    kernel = flashattn_cim(batch, heads, seq_len, dim, is_causal,
+    kernel = flashattn_cim(batch, heads, seq_q, seq_kv, dim, is_causal,
                            block_M=block_M, block_N=block_N, num_stages=num_stages, threads=threads,
                            micro_m=micro_m, micro_n=micro_n, micro_k=micro_k,
                            cim_stride_index=cim_stride_index)
 
-    # CIM capacity report: K and V matrices live in CIM
     report_cim_capacity(
         cim_buffers=[
             ("K_shared", (block_N, dim), "float16"),
@@ -147,27 +159,26 @@ def main(
     profiler = kernel.get_profiler()
     latency = profiler.do_bench(backend="cupti", n_warmup=50, n_repeat=200)
     micro_str = f"micro={micro_m}/{micro_n}/{micro_k}" if any([micro_m, micro_n, micro_k]) else "micro=default"
-    print(f"CIM FA ({micro_str}): {latency:.2f} ms, {total_flops / latency * 1e-9:.2f} TFlops")
+    print(f"CIM FA BHSD ({micro_str}): {latency:.2f} ms, {total_flops / latency * 1e-9:.2f} TFlops")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="CIM Flash Attention with CIM instruction shape control")
-    parser.add_argument("--batch", type=int, default=8, help="batch size")
-    parser.add_argument("--heads", type=int, default=32, help="heads")
-    parser.add_argument("--seq_len", type=int, default=4096, help="sequence length")
-    parser.add_argument("--dim", type=int, default=128, help="dim")
-    parser.add_argument("--is_causal", action="store_true", help="causal")
-    parser.add_argument("--micro_m", type=int, default=0, help="CIM instruction M dim (0=default)")
-    parser.add_argument("--micro_n", type=int, default=0, help="CIM instruction N dim (0=default)")
-    parser.add_argument("--micro_k", type=int, default=0, help="CIM instruction K dim (0=default)")
-    parser.add_argument("--cim_stride_index", action="store_true",
-                        help="Use CIM micro-based strides for A/C indexing (arch-accurate, slower on GPU)")
+    parser = argparse.ArgumentParser(description="CIM Flash Attention BHSD (supports seq_q != seq_kv)")
+    parser.add_argument("--batch", type=int, default=8)
+    parser.add_argument("--heads", type=int, default=32)
+    parser.add_argument("--seq_q", type=int, default=4096)
+    parser.add_argument("--seq_kv", type=int, default=4096)
+    parser.add_argument("--dim", type=int, default=128)
+    parser.add_argument("--is_causal", action="store_true")
+    parser.add_argument("--micro_m", type=int, default=0)
+    parser.add_argument("--micro_n", type=int, default=0)
+    parser.add_argument("--micro_k", type=int, default=0)
+    parser.add_argument("--cim_stride_index", action="store_true")
     parser.add_argument("--block_M", type=int, default=128)
     parser.add_argument("--block_N", type=int, default=128)
     parser.add_argument("--num_stages", type=int, default=2)
     parser.add_argument("--threads", type=int, default=256)
     args = parser.parse_args()
-    main(args.batch, args.heads, args.seq_len, args.dim, args.is_causal,
+    main(args.batch, args.heads, args.seq_q, args.seq_kv, args.dim, args.is_causal,
          args.micro_m, args.micro_n, args.micro_k, args.cim_stride_index,
          args.block_M, args.block_N, args.num_stages, args.threads)
