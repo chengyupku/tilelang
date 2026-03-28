@@ -148,7 +148,7 @@ def report_cim_capacity(cim_buffers, num_stages, kernel, threads_per_block):
 
 @tilelang.jit(out_idx=[-1])
 def matmul_cim(M, N, K, block_M, block_N, block_K, dtype=T.float16, accum_dtype=T.float32,
-               num_stages=3, micro_m=0, micro_n=0, micro_k=0):
+               num_stages=3, micro_m=0, micro_n=0, micro_k=0, cim_stride_index=False):
     @T.prim_func
     def kernel(A: T.Tensor((M, K), dtype), B: T.Tensor((N, K), dtype),
                C: T.Tensor((M, N), accum_dtype)):
@@ -162,18 +162,20 @@ def matmul_cim(M, N, K, block_M, block_N, block_K, dtype=T.float16, accum_dtype=
                 T.copy(A[by * block_M, k * block_K], A_shared)
                 T.copy(B[bx * block_N, k * block_K], B_shared)
                 T.gemm(A_shared, B_shared, C_local, transpose_B=True, cim_simulate=True,
-                       cim_micro_m=micro_m, cim_micro_n=micro_n, cim_micro_k=micro_k)
+                       cim_micro_m=micro_m, cim_micro_n=micro_n, cim_micro_k=micro_k,
+                       cim_stride_index=cim_stride_index)
             T.copy(C_local, C[by * block_M, bx * block_N])
     return kernel
 
 
 def main(M=8192, N=8192, K=4096, block_M=128, block_N=128, block_K=64,
-         dtype="int8", num_stages=3, micro_m=0, micro_n=0, micro_k=0):
+         dtype="int8", num_stages=3, micro_m=0, micro_n=0, micro_k=0,
+         cim_stride_index=False):
     tl_dtype = DTYPE_MAP[dtype]
     accum_dtype = ACCUM_MAP[dtype]
     tops = 2 * M * N * K / 1e12
     kernel = matmul_cim(M, N, K, block_M, block_N, block_K, tl_dtype, accum_dtype,
-                        num_stages, micro_m, micro_n, micro_k)
+                        num_stages, micro_m, micro_n, micro_k, cim_stride_index)
 
     # CIM capacity report: B matrix lives in CIM
     report_cim_capacity(
@@ -203,6 +205,9 @@ if __name__ == "__main__":
     parser.add_argument("--micro_m", type=int, default=16, help="CIM instruction M dim (0=hardware default)")
     parser.add_argument("--micro_n", type=int, default=8, help="CIM instruction N dim (0=hardware default)")
     parser.add_argument("--micro_k", type=int, default=16, help="CIM instruction K dim (0=hardware default)")
+    parser.add_argument("--cim_stride_index", action="store_true",
+                        help="Use CIM micro-based strides for A/C indexing (arch-accurate, slower on GPU)")
     args = parser.parse_args()
     main(args.M, args.N, args.K, args.block_M, args.block_N, args.block_K,
-         args.dtype, args.num_stages, args.micro_m, args.micro_n, args.micro_k)
+         args.dtype, args.num_stages, args.micro_m, args.micro_n, args.micro_k,
+         args.cim_stride_index)

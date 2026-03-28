@@ -132,7 +132,7 @@ def report_cim_capacity(cim_buffers, num_stages, kernel, threads_per_block):
 )
 def flashattn_cim(batch, heads, seq_len, dim, is_causal,
                   block_M=128, block_N=128, num_stages=1, threads=256,
-                  micro_m=0, micro_n=0, micro_k=0):
+                  micro_m=0, micro_n=0, micro_k=0, cim_stride_index=False):
     scale = (1.0 / dim) ** 0.5 * 1.44269504  # log2(e)
     shape = [batch, seq_len, heads, dim]
     dtype = T.float16
@@ -182,7 +182,8 @@ def flashattn_cim(batch, heads, seq_len, dim, is_causal,
                 T.gemm(Q_shared, K_shared, acc_s, transpose_B=True,
                        policy=T.GemmWarpPolicy.FullRow,
                        cim_simulate=True,
-                       cim_micro_m=micro_m, cim_micro_n=micro_n, cim_micro_k=micro_k)
+                       cim_micro_m=micro_m, cim_micro_n=micro_n, cim_micro_k=micro_k,
+                       cim_stride_index=cim_stride_index)
 
                 T.copy(scores_max, scores_max_prev)
                 T.fill(scores_max, -T.infinity(accum_dtype))
@@ -204,7 +205,8 @@ def flashattn_cim(batch, heads, seq_len, dim, is_causal,
                 T.copy(V[bz, k * block_N : (k + 1) * block_N, by, :], V_shared)
                 T.gemm(acc_s_cast, V_shared, acc_o, policy=T.GemmWarpPolicy.FullRow,
                        cim_simulate=True,
-                       cim_micro_m=micro_m, cim_micro_n=micro_n, cim_micro_k=micro_k)
+                       cim_micro_m=micro_m, cim_micro_n=micro_n, cim_micro_k=micro_k,
+                       cim_stride_index=cim_stride_index)
 
             for i, j in T.Parallel(block_M, dim):
                 acc_o[i, j] /= logsum[i]
@@ -223,6 +225,7 @@ def main(
     micro_m: int = 0,
     micro_n: int = 0,
     micro_k: int = 0,
+    cim_stride_index: bool = False,
     block_M: int = 128,
     block_N: int = 128,
     num_stages: int = 1,
@@ -235,7 +238,8 @@ def main(
 
     kernel = flashattn_cim(batch, heads, seq_len, dim, is_causal,
                            block_M=block_M, block_N=block_N, num_stages=num_stages, threads=threads,
-                           micro_m=micro_m, micro_n=micro_n, micro_k=micro_k)
+                           micro_m=micro_m, micro_n=micro_n, micro_k=micro_k,
+                           cim_stride_index=cim_stride_index)
 
     # CIM capacity report: K and V matrices live in CIM
     report_cim_capacity(
@@ -265,11 +269,13 @@ if __name__ == "__main__":
     parser.add_argument("--micro_m", type=int, default=0, help="CIM instruction M dim (0=default)")
     parser.add_argument("--micro_n", type=int, default=0, help="CIM instruction N dim (0=default)")
     parser.add_argument("--micro_k", type=int, default=0, help="CIM instruction K dim (0=default)")
+    parser.add_argument("--cim_stride_index", action="store_true",
+                        help="Use CIM micro-based strides for A/C indexing (arch-accurate, slower on GPU)")
     parser.add_argument("--block_M", type=int, default=128)
     parser.add_argument("--block_N", type=int, default=128)
     parser.add_argument("--num_stages", type=int, default=2)
     parser.add_argument("--threads", type=int, default=256)
     args = parser.parse_args()
     main(args.batch, args.heads, args.seq_len, args.dim, args.is_causal,
-         args.micro_m, args.micro_n, args.micro_k,
+         args.micro_m, args.micro_n, args.micro_k, args.cim_stride_index,
          args.block_M, args.block_N, args.num_stages, args.threads)

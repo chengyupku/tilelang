@@ -35,6 +35,7 @@ def _gemm_impl(
     cim_micro_m: int = 0,
     cim_micro_n: int = 0,
     cim_micro_k: int = 0,
+    cim_stride_index: bool = False,
 ) -> tir.PrimExpr:
     """Shared GEMM implementation.
 
@@ -140,6 +141,7 @@ def _gemm_impl(
         cim_micro_m,
         cim_micro_n,
         cim_micro_k,
+        cim_stride_index,
     )
 
 
@@ -159,6 +161,7 @@ def gemm_v1(
     cim_micro_m: int = 0,
     cim_micro_n: int = 0,
     cim_micro_k: int = 0,
+    cim_stride_index: bool = False,
 ) -> tir.PrimExpr:
     """GEMM v1: use op tl.gemm."""
     return _gemm_impl(
@@ -175,6 +178,7 @@ def gemm_v1(
         mbar,
         cim_simulate,
         cim_micro_m, cim_micro_n, cim_micro_k,
+        cim_stride_index,
     )
 
 
@@ -194,6 +198,7 @@ def gemm_v2(
     cim_micro_m: int = 0,
     cim_micro_n: int = 0,
     cim_micro_k: int = 0,
+    cim_stride_index: bool = False,
 ) -> tir.PrimExpr:
     """GEMM v2: use op tl.gemm_py."""
     return _gemm_impl(
@@ -210,6 +215,7 @@ def gemm_v2(
         mbar,
         cim_simulate,
         cim_micro_m, cim_micro_n, cim_micro_k,
+        cim_stride_index,
     )
 
 
@@ -232,6 +238,7 @@ def gemm(
     cim_micro_m: int = 0,
     cim_micro_n: int = 0,
     cim_micro_k: int = 0,
+    cim_stride_index: bool = False,
 ) -> tir.PrimExpr:
     """TileLang GEMM operator.
 
@@ -250,6 +257,7 @@ def gemm(
         cim_micro_m (int): CIM instruction M dimension. 0 = hardware MMA default.
         cim_micro_n (int): CIM instruction N dimension. 0 = hardware MMA default.
         cim_micro_k (int): CIM instruction K dimension. 0 = hardware MMA default.
+        cim_stride_index (bool): If True, use CIM micro-based strides for A/C indexing. Defaults to False.
 
     Returns:
         tir.Call: A handle to the GEMM operation.
@@ -257,4 +265,4 @@ def gemm(
 
     impl = gemm_v1 if _env.use_gemm_v1() else gemm_v2
     return impl(A, B, C, transpose_A, transpose_B, policy, clear_accum, k_pack, wg_wait, mbar,
-                cim_simulate, cim_micro_m, cim_micro_n, cim_micro_k)
+                cim_simulate, cim_micro_m, cim_micro_n, cim_micro_k, cim_stride_index)

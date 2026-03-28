@@ -144,6 +144,10 @@ class GemmBase:
         return int(getattr(self.gemm_node, "cimMicroK", 0))
 
     @property
+    def cim_stride_index(self) -> bool:
+        return bool(getattr(self.gemm_node, "cimStrideIndex", False))
+
+    @property
     def mbar(self) -> tir.BufferLoad | None:
         return getattr(self.gemm_node, "mbar", None)
 

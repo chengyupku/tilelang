@@ -104,6 +104,7 @@ class GemmMMA(GemmBase):
                 cim_micro_m=eff_micro_m,
                 cim_micro_n=eff_micro_n,
                 cim_micro_k=eff_micro_k,
+                cim_stride_index=self.cim_stride_index,
             )
             # Override micro_size_k for K loop bound
             micro_size_k_for_loop = eff_micro_k if has_cim_micro else None

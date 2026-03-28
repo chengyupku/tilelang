@@ -40,6 +40,7 @@ public:
   int cimMicroM_ = 0;
   int cimMicroN_ = 0;
   int cimMicroK_ = 0;
+  bool cimStrideIndex_ = false;
 
   TVM_FFI_DECLARE_OBJECT_INFO_FINAL("tl.GemmPy", GemmPyNode, TileOperatorNode);
 
@@ -70,7 +71,8 @@ public:
         .def_ro("cimSimulate", &GemmPyNode::cimSimulate_)
         .def_ro("cimMicroM", &GemmPyNode::cimMicroM_)
         .def_ro("cimMicroN", &GemmPyNode::cimMicroN_)
-        .def_ro("cimMicroK", &GemmPyNode::cimMicroK_);
+        .def_ro("cimMicroK", &GemmPyNode::cimMicroK_)
+        .def_ro("cimStrideIndex", &GemmPyNode::cimStrideIndex_);
   }
 
   Stmt Lower(const LowerArgs &T, arith::Analyzer *analyzer) const override;
