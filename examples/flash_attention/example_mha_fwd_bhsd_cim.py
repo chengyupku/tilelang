@@ -131,6 +131,7 @@ def main(
     micro_n: int = 0,
     micro_k: int = 0,
     cim_stride_index: bool = False,
+    tracekernel: bool = False,
     block_M: int = 128,
     block_N: int = 128,
     num_stages: int = 2,
@@ -145,7 +146,6 @@ def main(
                            block_M=block_M, block_N=block_N, num_stages=num_stages, threads=threads,
                            micro_m=micro_m, micro_n=micro_n, micro_k=micro_k,
                            cim_stride_index=cim_stride_index)
-
     report_cim_capacity(
         cim_buffers=[
             ("K_shared", (block_N, dim), "float16"),
@@ -155,6 +155,10 @@ def main(
         kernel=kernel,
         threads_per_block=threads,
     )
+
+    if tracekernel:
+        kernel.get_profiler().do_bench(n_warmup=0, n_repeat=1)
+        return
 
     profiler = kernel.get_profiler()
     latency = profiler.do_bench(backend="cupti", n_warmup=50, n_repeat=200)
@@ -175,11 +179,12 @@ if __name__ == "__main__":
     parser.add_argument("--micro_k", type=int, default=0, help="CIM instruction K dim (0=hardware default)")
     parser.add_argument("--cim_stride_index", action="store_true", default=False,
                         help="Use CIM micro-based strides for A/C indexing (arch-accurate, slower on GPU)")
+    parser.add_argument("--tracekernel", action="store_true", help="Run kernel once for nsys/ncu tracing")
     parser.add_argument("--block_M", type=int, default=128)
     parser.add_argument("--block_N", type=int, default=128)
     parser.add_argument("--num_stages", type=int, default=2)
     parser.add_argument("--threads", type=int, default=256)
     args = parser.parse_args()
     main(args.batch, args.heads, args.seq_q, args.seq_kv, args.dim, args.is_causal,
-         args.micro_m, args.micro_n, args.micro_k, args.cim_stride_index,
+         args.micro_m, args.micro_n, args.micro_k, args.cim_stride_index, args.tracekernel,
          args.block_M, args.block_N, args.num_stages, args.threads)

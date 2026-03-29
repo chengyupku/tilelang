@@ -137,6 +137,8 @@ def main(
     dim: int = 128,
     is_causal: bool = False,
     tune: bool = False,
+    tracekernel: bool = False,
+    no_ref: bool = False,
     block_M: int = 128,
     block_N: int = 128,
     num_stages: int = 2,
@@ -151,14 +153,17 @@ def main(
         kernel = flashattn(batch, heads, seq_q, seq_kv, dim, is_causal,
                            block_M=block_M, block_N=block_N, num_stages=num_stages, threads=threads)
         report_kernel_resources(kernel, threads)
-        ref_program_processed = partial(ref_program, is_causal=is_causal)
-
+        if tracekernel:
+            kernel.get_profiler().do_bench(n_warmup=0, n_repeat=1)
+            return
         profiler = kernel.get_profiler()
-        profiler.assert_allclose(ref_program_processed, rtol=0.01, atol=0.01)
-        print("All checks pass.")
-        latency = profiler.do_bench(ref_program_processed, n_warmup=50, n_repeat=200)
-        print("Ref: {:.2f} ms".format(latency))
-        print("Ref: {:.2f} TFlops".format(total_flops / latency * 1e-9))
+        if not no_ref:
+            ref_program_processed = partial(ref_program, is_causal=is_causal)
+            profiler.assert_allclose(ref_program_processed, rtol=0.01, atol=0.01)
+            print("All checks pass.")
+            latency = profiler.do_bench(ref_program_processed, n_warmup=50, n_repeat=200)
+            print("Ref: {:.2f} ms".format(latency))
+            print("Ref: {:.2f} TFlops".format(total_flops / latency * 1e-9))
         latency = profiler.do_bench(n_warmup=50, n_repeat=200)
         print("Tile-lang: {:.2f} ms".format(latency))
         print("Tile-lang: {:.2f} TFlops".format(total_flops / latency * 1e-9))
@@ -182,10 +187,12 @@ if __name__ == "__main__":
     parser.add_argument("--dim", type=int, default=128, help="head dimension")
     parser.add_argument("--is_causal", action="store_true", help="causal attention")
     parser.add_argument("--tune", action="store_true", help="tune configs")
+    parser.add_argument("--tracekernel", action="store_true", help="Run kernel once for nsys/ncu tracing")
+    parser.add_argument("--no_ref", action="store_true", help="Skip torch reference check and comparison")
     parser.add_argument("--block_M", type=int, default=128)
     parser.add_argument("--block_N", type=int, default=128)
     parser.add_argument("--num_stages", type=int, default=2)
     parser.add_argument("--threads", type=int, default=256)
     args = parser.parse_args()
-    main(args.batch, args.heads, args.seq_q, args.seq_kv, args.dim, args.is_causal, args.tune,
-         args.block_M, args.block_N, args.num_stages, args.threads)
+    main(args.batch, args.heads, args.seq_q, args.seq_kv, args.dim, args.is_causal,
+         args.tune, args.tracekernel, args.no_ref, args.block_M, args.block_N, args.num_stages, args.threads)

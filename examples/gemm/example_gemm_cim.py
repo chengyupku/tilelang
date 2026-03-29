@@ -15,11 +15,11 @@ from utils.kernel_report import report_cim_capacity
 
 @tilelang.jit(out_idx=[-1])
 def matmul_cim(M, N, K, block_M, block_N, block_K, dtype=T.float16, accum_dtype=T.float32,
-               num_stages=3, micro_m=0, micro_n=0, micro_k=0, cim_stride_index=False):
+               num_stages=3, threads=128, micro_m=0, micro_n=0, micro_k=0, cim_stride_index=False):
     @T.prim_func
     def kernel(A: T.Tensor((M, K), dtype), B: T.Tensor((N, K), dtype),
                C: T.Tensor((M, N), accum_dtype)):
-        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=128) as (bx, by):
+        with T.Kernel(T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=threads) as (bx, by):
             A_shared = T.alloc_shared((block_M, block_K), dtype)
             B_shared = T.alloc_shared((block_N, block_K), dtype)
             C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
@@ -36,21 +36,24 @@ def matmul_cim(M, N, K, block_M, block_N, block_K, dtype=T.float16, accum_dtype=
 
 
 def main(M=8192, N=8192, K=4096, block_M=128, block_N=128, block_K=64,
-         dtype="int8", num_stages=3, micro_m=0, micro_n=0, micro_k=0,
-         cim_stride_index=False):
+         dtype="int8", num_stages=3, threads=128, micro_m=0, micro_n=0, micro_k=0,
+         cim_stride_index=False, tracekernel=False):
     tl_dtype = DTYPE_MAP[dtype]
     accum_dtype = ACCUM_MAP[dtype]
     tops = 2 * M * N * K / 1e12
     kernel = matmul_cim(M, N, K, block_M, block_N, block_K, tl_dtype, accum_dtype,
-                        num_stages, micro_m, micro_n, micro_k, cim_stride_index)
-
+                        num_stages, threads, micro_m, micro_n, micro_k, cim_stride_index)
     # CIM capacity report: B matrix lives in CIM
     report_cim_capacity(
         cim_buffers=[("B_shared", (block_N, block_K), dtype)],
         num_stages=num_stages,
         kernel=kernel,
-        threads_per_block=128,
+        threads_per_block=threads,
     )
+
+    if tracekernel:
+        kernel.get_profiler().do_bench(n_warmup=0, n_repeat=1)
+        return
 
     profiler = kernel.get_profiler()
     latency = profiler.do_bench(n_warmup=50, n_repeat=200)
@@ -69,12 +72,14 @@ if __name__ == "__main__":
     parser.add_argument("--block_K", type=int, default=64)
     parser.add_argument("--dtype", type=str, default="float16", choices=["float16", "int8"])
     parser.add_argument("--num_stages", type=int, default=3)
+    parser.add_argument("--threads", type=int, default=128)
     parser.add_argument("--micro_m", type=int, default=16, help="CIM instruction M dim (0=hardware default)")
     parser.add_argument("--micro_n", type=int, default=8, help="CIM instruction N dim (0=hardware default)")
     parser.add_argument("--micro_k", type=int, default=16, help="CIM instruction K dim (0=hardware default)")
     parser.add_argument("--cim_stride_index", action="store_true", default=False,
                         help="Use CIM micro-based strides for A/C indexing (arch-accurate, slower on GPU)")
+    parser.add_argument("--tracekernel", action="store_true", help="Run kernel once for nsys/ncu tracing")
     args = parser.parse_args()
     main(args.M, args.N, args.K, args.block_M, args.block_N, args.block_K,
-         args.dtype, args.num_stages, args.micro_m, args.micro_n, args.micro_k,
-         args.cim_stride_index)
+         args.dtype, args.num_stages, args.threads, args.micro_m, args.micro_n, args.micro_k,
+         args.cim_stride_index, args.tracekernel)
