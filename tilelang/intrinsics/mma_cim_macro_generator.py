@@ -268,8 +268,11 @@ class CIMTensorCoreIntrinEmitter(_BaseTensorCoreIntrinEmitter):
 
         return _warp_ldmatrix_a(A_local_buf, A_shared_buf, ki, thread_binding, rk)
 
-    def ldmatrix_b(self, B_local_buf: Buffer, B_shared_buf: Buffer,
+    def ldmatrix_b(self, B_local_buf: Buffer, B_shared_buf,
                    ki: PrimExpr, rk: PrimExpr | None = 0):
+        from tvm.tir import BufferRegion
+        if isinstance(B_shared_buf, BufferRegion):
+            B_shared_buf = B_shared_buf.buffer
         warp_col_tiles = self.warp_col_tiles
         chunk = self.chunk
         micro_size_y = self.micro_size_y
@@ -408,10 +411,11 @@ class CIMTensorCoreIntrinEmitter(_BaseTensorCoreIntrinEmitter):
     # ------------------------------------------------------------------
 
     def ldmatrix_a_mi(self, A_local_buf: Buffer, A_shared_buf,
-                      ki: PrimExpr, mi: PrimExpr, rk: PrimExpr | None = 0):
+                      ki: PrimExpr, mi: PrimExpr, rk: PrimExpr | None = 0,
+                      a_buf_offset: PrimExpr | int = 0):
         """Load A for a single hw M position (mi) at K position (ki).
 
-        Writes to A_local_buf starting at offset 0 (A_local holds one position).
+        Writes to A_local_buf at a_buf_offset (for double buffering).
         """
         from tvm.tir import BufferRegion
         if isinstance(A_shared_buf, BufferRegion):
@@ -427,7 +431,8 @@ class CIMTensorCoreIntrinEmitter(_BaseTensorCoreIntrinEmitter):
         thread_binding = self.get_thread_binding()
 
         @T.macro
-        def _load_mi(A_local_buf, A_shared_buf, ki, mi, thread_binding, rk=0):
+        def _load_mi(A_local_buf, A_shared_buf, ki, mi, thread_binding,
+                      rk=0, a_buf_offset=0):
             stride = A_shared_buf.shape[-1]
             tx, _, warp_m = self.extract_thread_binding(thread_binding)
             trans = self.a_transposed
@@ -436,16 +441,17 @@ class CIMTensorCoreIntrinEmitter(_BaseTensorCoreIntrinEmitter):
             A_elem = A_shared_buf[wk, wi] if a_transposed else A_shared_buf[wi, wk]
             T.ptx_ldmatrix(
                 a_dtype, T.bool(trans), 4, ".b16",
-                A_local_buf.data, 0,
+                A_local_buf.data, a_buf_offset,
                 T.address_of(A_elem),
                 get_ldmatrix_offset("A", tx, 0, stride, a_dtype, a_transposed),
             )
 
-        return _load_mi(A_local_buf, A_shared_buf, ki, mi, thread_binding, rk)
+        return _load_mi(A_local_buf, A_shared_buf, ki, mi, thread_binding,
+                         rk, a_buf_offset)
 
     def mma_mi(self, A_local_buf: Buffer, B_local_buf: Buffer, C_local_buf: Buffer,
                ki: PrimExpr, mi: PrimExpr, cim_simulate: bool = False,
-               offset: PrimExpr | None = 0):
+               offset: PrimExpr | None = 0, a_buf_offset: PrimExpr | int = 0):
         """MMA for a single hw M position (mi) across all hw N positions."""
         hw_warp_cols = self.warp_cols
         local_size_a_hw = self.local_size_a
@@ -462,9 +468,9 @@ class CIMTensorCoreIntrinEmitter(_BaseTensorCoreIntrinEmitter):
         b_local_stride: PrimExpr = ki * hw_warp_cols * local_size_b if b_is_fragment else 0
 
         @T.macro
-        def _mma_mi(A_local_buf, B_local_buf, C_local_buf):
+        def _mma_mi(A_local_buf, B_local_buf, C_local_buf, a_buf_offset=0):
             for j in T.serial(hw_warp_cols):
-                a_off = 0
+                a_off = a_buf_offset
                 c_off = mi * hw_warp_cols * local_size_out_hw + j * local_size_out_hw
                 b_off = b_local_stride + j * local_size_b
                 T.ptx_mma(
@@ -486,7 +492,91 @@ class CIMTensorCoreIntrinEmitter(_BaseTensorCoreIntrinEmitter):
                         T.bool(False), None, cim_simulate,
                     )
 
-        return _mma_mi(A_local_buf, B_local_buf, C_local_buf)
+        return _mma_mi(A_local_buf, B_local_buf, C_local_buf, a_buf_offset)
+
+    # ------------------------------------------------------------------
+    # N-inner methods: load/compute one hw N position at a time
+    # ------------------------------------------------------------------
+
+    def ldmatrix_b_nj(self, B_local_buf: Buffer, B_shared_buf,
+                      ki: PrimExpr, nj: PrimExpr, rk: PrimExpr | None = 0,
+                      b_buf_offset: PrimExpr | int = 0):
+        """Load B for a single hw N position (nj) at K position (ki)."""
+        from tvm.tir import BufferRegion
+        if isinstance(B_shared_buf, BufferRegion):
+            B_shared_buf = B_shared_buf.buffer
+        warp_col_tiles = self.warp_col_tiles
+        micro_size_y = self.micro_size_y
+        micro_size_k = self.micro_size_k
+        local_size_b = self.local_size_b
+        chunk = self.chunk
+        b_dtype = self.b_dtype
+        b_transposed = self.b_transposed
+        replicate_b = self.n_dim == 16
+
+        thread_binding = self.get_thread_binding()
+
+        @T.macro
+        def _load_nj(B_local_buf, B_shared_buf, ki, nj, thread_binding,
+                      rk=0, b_buf_offset=0):
+            stride = B_shared_buf.shape[-1]
+            tx, warp_n, _ = self.extract_thread_binding(thread_binding)
+            trans = not b_transposed
+            wi = warp_n * warp_col_tiles + nj * micro_size_y
+            wk = rk * chunk + ki * micro_size_k
+            B_elem = B_shared_buf[wi, wk] if b_transposed else B_shared_buf[wk, wi]
+            T.ptx_ldmatrix(
+                b_dtype, T.bool(trans),
+                4 if replicate_b else 2,
+                ".b16",
+                B_local_buf.data, b_buf_offset,
+                T.address_of(B_elem),
+                get_ldmatrix_offset("B", tx, 0, stride, b_dtype, b_transposed),
+            )
+
+        return _load_nj(B_local_buf, B_shared_buf, ki, nj, thread_binding,
+                         rk, b_buf_offset)
+
+    def mma_nj(self, A_local_buf: Buffer, B_local_buf: Buffer, C_local_buf: Buffer,
+               ki: PrimExpr, nj: PrimExpr, b_buf_offset: PrimExpr | int = 0):
+        """MMA for all hw M positions × one hw N position (nj)."""
+        hw_warp_rows = self.warp_rows
+        local_size_a_hw = self.local_size_a
+        local_size_b = self.local_size_b
+        local_size_out_hw = self.local_size_out
+        a_dtype_abbrv = self.a_dtype_abbrv
+        b_dtype_abbrv = self.b_dtype_abbrv
+        accum_dtype = self.accum_dtype
+        accum_dtype_abbrv = self.accum_dtype_abbrv
+        mma_prefix = self.mma_prefix
+        replicate_b = self.n_dim == 16
+
+        @T.macro
+        def _mma_nj(A_local_buf, B_local_buf, C_local_buf, b_buf_offset=0):
+            for mi in T.serial(hw_warp_rows):
+                a_off = mi * local_size_a_hw
+                c_off = mi * self.warp_cols * local_size_out_hw + nj * local_size_out_hw
+                b_off = b_buf_offset
+                T.ptx_mma(
+                    accum_dtype, mma_prefix, "row", "col",
+                    a_dtype_abbrv, b_dtype_abbrv, accum_dtype_abbrv,
+                    A_local_buf.data, a_off,
+                    B_local_buf.data, b_off,
+                    C_local_buf.data, c_off,
+                    T.bool(False),
+                )
+                if replicate_b:
+                    T.ptx_mma(
+                        accum_dtype, mma_prefix, "row", "col",
+                        a_dtype_abbrv, b_dtype_abbrv, accum_dtype_abbrv,
+                        A_local_buf.data, a_off,
+                        B_local_buf.data,
+                        b_off + lift(local_size_b) // 2,
+                        C_local_buf.data, c_off + lift(local_size_out_hw) // 2,
+                        T.bool(False),
+                    )
+
+        return _mma_nj(A_local_buf, B_local_buf, C_local_buf, b_buf_offset)
 
     # ------------------------------------------------------------------
     # stmatrix override (CIM micro-based warp dims)

@@ -116,6 +116,13 @@ GemmPy::GemmPy(Array<PrimExpr> args, Map<String, ObjectRef> annotations) {
       node->cimStrideIndex_ = b.value();
     }
   }
+  if (args.size() > 24) {
+    if (const auto *imm = args[24].as<IntImmNode>()) {
+      node->cimMInner_ = (imm->value != 0);
+    } else if (auto b = args[24].as<Bool>()) {
+      node->cimMInner_ = b.value();
+    }
+  }
   data_ = std::move(node);
 }
 

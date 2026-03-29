@@ -96,8 +96,8 @@ class GemmMMA(GemmBase):
                 warp_col_tiles=warp_col_tiles,
                 chunk=self.chunk,
                 thread_var=thread_var,
-                fake_instr_m=16,  # always use standard MMA m
-                fake_instr_n=8,   # always use standard MMA n
+                fake_instr_m=16,
+                fake_instr_n=8,
                 fake_instr_k=mma_k,
                 fake_warp_rows=fake_warp_rows,
                 fake_warp_cols=fake_warp_cols,
@@ -106,7 +106,6 @@ class GemmMMA(GemmBase):
                 cim_micro_k=eff_micro_k,
                 cim_stride_index=self.cim_stride_index,
             )
-            # Override micro_size_k for K loop bound
             micro_size_k_for_loop = eff_micro_k if has_cim_micro else None
         else:
             mma_emitter = TensorCoreIntrinEmitter(
@@ -122,7 +121,7 @@ class GemmMMA(GemmBase):
                 chunk=self.chunk,
                 thread_var=thread_var,
             )
-            micro_size_k_for_loop = None  # use emitter's default
+            micro_size_k_for_loop = None
 
         in_dtype = self.in_dtype
         warp_rows = mma_emitter.warp_rows
@@ -168,7 +167,9 @@ class GemmMMA(GemmBase):
         #   m_step = M_DIM * mma_k / micro_k  (M rows per step)
         #   k_step = micro_k                   (K cols per step)
         #   Total data per step = m_step * k_step = M_DIM * mma_k = 256 (1 ldmatrix)
-        cim_m_inner = cim_simulate
+        # CIM block-tile iteration: M-outer/K-inner with A double buffer (True),
+        # or K-only iteration (False). Controlled via T.gemm(cim_m_inner=...).
+        cim_m_inner = cim_simulate and self.cim_m_inner
         mma_k_hw = mma_emitter.micro_size_k  # hardware mma_k
         k_hw_iters = block_K // mma_k_hw      # total hw K iterations
         if cim_m_inner and eff_micro_k > mma_k_hw:
@@ -191,8 +192,8 @@ class GemmMMA(GemmBase):
                 accumulating into C_local.
                 """
                 if cim_m_inner:
-                    # M-inner: A_local holds one hw M position (one ldmatrix worth)
-                    A_local = T.alloc_local((local_size_a), in_dtype)
+                    # CIM M-inner: A_local double-buffered (2 × one ldmatrix worth)
+                    A_local = T.alloc_local((2 * local_size_a), in_dtype)
                 else:
                     A_local = T.alloc_local((a_local_size), in_dtype)
                 if not cim_simulate:
@@ -201,24 +202,64 @@ class GemmMMA(GemmBase):
                     T.clear(C_buf)
 
                 if cim_m_inner:
-                    # CIM M-outer/K-inner loop with micro-aware granularity.
-                    # mi/ki reflect CIM micro_shape; hw_mi/hw_ki map to hardware.
-                    for mi in T.serial(0, cim_mi_iters):
-                        for ki in T.serial(0, cim_ki_iters):
-                            # Map CIM loop vars → hardware ldmatrix/MMA positions
-                            hw_mi = mi // m_per_M_DIM
-                            k_offset = mi % m_per_M_DIM
-                            hw_ki = ki * m_per_M_DIM + k_offset
-                            mma_emitter.ldmatrix_a_mi(A_local, A_region, hw_ki, hw_mi)
-                            mma_emitter.mma_mi(A_local, B_buf, C_buf, hw_ki, hw_mi,
-                                               cim_simulate=True)
+                    # CIM M-outer/K-inner with double-buffered A_local.
+                    # Prefetch next A while computing current, hiding ldmatrix latency.
+                    total_steps = cim_mi_iters * cim_ki_iters
+
+                    # Prologue: load first step into buffer 0
+                    mma_emitter.ldmatrix_a_mi(A_local, A_region, 0, 0,
+                                              a_buf_offset=0)
+
+                    for step in T.serial(0, total_steps - 1):
+                        cur_buf = (step % 2) * local_size_a
+                        nxt_buf = ((step + 1) % 2) * local_size_a
+                        # Current step hw positions
+                        mi_c = step // cim_ki_iters
+                        ki_c = step % cim_ki_iters
+                        hw_mi_c = mi_c // m_per_M_DIM
+                        hw_ki_c = ki_c * m_per_M_DIM + mi_c % m_per_M_DIM
+                        # Next step hw positions
+                        mi_n = (step + 1) // cim_ki_iters
+                        ki_n = (step + 1) % cim_ki_iters
+                        hw_mi_n = mi_n // m_per_M_DIM
+                        hw_ki_n = ki_n * m_per_M_DIM + mi_n % m_per_M_DIM
+                        # Prefetch next A into other buffer
+                        mma_emitter.ldmatrix_a_mi(
+                            A_local, A_region, hw_ki_n, hw_mi_n,
+                            a_buf_offset=nxt_buf)
+                        # Compute current from current buffer
+                        mma_emitter.mma_mi(
+                            A_local, B_buf, C_buf, hw_ki_c, hw_mi_c,
+                            cim_simulate=True, a_buf_offset=cur_buf)
+
+                    # Epilogue: compute last step (Python-level constants)
+                    last = total_steps - 1
+                    last_buf = (last % 2) * local_size_a
+                    mi_l = last // cim_ki_iters
+                    ki_l = last % cim_ki_iters
+                    hw_mi_l = mi_l // m_per_M_DIM
+                    hw_ki_l = ki_l * m_per_M_DIM + mi_l % m_per_M_DIM
+                    mma_emitter.mma_mi(
+                        A_local, B_buf, C_buf, hw_ki_l, hw_mi_l,
+                        cim_simulate=True, a_buf_offset=last_buf)
                 else:
-                    # Non-CIM baseline: standard K-inner loop
+                    # K-inner loop: baseline (A+B load) or CIM K-only fallback
                     for ki in T.serial(0, (block_K // micro_size_k)):
-                        TensorCoreIntrinEmitter.ldmatrix_a(
-                            mma_emitter, A_local, A_region, ki)
-                        mma_emitter.ldmatrix_b(B_local, B_region, ki)
-                        mma_emitter.mma(A_local, B_local, C_buf, ki)
+                        for k_sub in T.serial(0, k_sub_steps):
+                            if cim_simulate:
+                                mma_emitter.ldmatrix_a(
+                                    A_local, A_region,
+                                    ki * k_sub_steps + k_sub,
+                                    a_local_offset=k_sub * hw_load_size)
+                            else:
+                                TensorCoreIntrinEmitter.ldmatrix_a(
+                                    mma_emitter, A_local, A_region,
+                                    ki * k_sub_steps + k_sub)
+                        if cim_simulate:
+                            mma_emitter.mma(A_local, B_buf, C_buf, ki, **mma_kwargs)
+                        else:
+                            mma_emitter.ldmatrix_b(B_local, B_region, ki)
+                            mma_emitter.mma(A_local, B_local, C_buf, ki)
 
             # Simplify to optimize the index computing
             # Must inline let statements to simplify the analysis

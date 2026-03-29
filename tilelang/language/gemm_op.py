@@ -36,6 +36,7 @@ def _gemm_impl(
     cim_micro_n: int = 0,
     cim_micro_k: int = 0,
     cim_stride_index: bool = False,
+    cim_m_inner: bool = True,
 ) -> tir.PrimExpr:
     """Shared GEMM implementation.
 
@@ -142,6 +143,7 @@ def _gemm_impl(
         cim_micro_n,
         cim_micro_k,
         cim_stride_index,
+        cim_m_inner,
     )
 
 
@@ -162,23 +164,15 @@ def gemm_v1(
     cim_micro_n: int = 0,
     cim_micro_k: int = 0,
     cim_stride_index: bool = False,
+    cim_m_inner: bool = True,
 ) -> tir.PrimExpr:
     """GEMM v1: use op tl.gemm."""
     return _gemm_impl(
         "tl.tileop.gemm",
-        A,
-        B,
-        C,
-        transpose_A,
-        transpose_B,
-        policy,
-        clear_accum,
-        k_pack,
-        wg_wait,
-        mbar,
-        cim_simulate,
-        cim_micro_m, cim_micro_n, cim_micro_k,
-        cim_stride_index,
+        A, B, C, transpose_A, transpose_B, policy, clear_accum,
+        k_pack, wg_wait, mbar,
+        cim_simulate, cim_micro_m, cim_micro_n, cim_micro_k,
+        cim_stride_index, cim_m_inner,
     )
 
 
@@ -199,23 +193,15 @@ def gemm_v2(
     cim_micro_n: int = 0,
     cim_micro_k: int = 0,
     cim_stride_index: bool = False,
+    cim_m_inner: bool = True,
 ) -> tir.PrimExpr:
     """GEMM v2: use op tl.gemm_py."""
     return _gemm_impl(
         "tl.tileop.gemm_py",
-        A,
-        B,
-        C,
-        transpose_A,
-        transpose_B,
-        policy,
-        clear_accum,
-        k_pack,
-        wg_wait,
-        mbar,
-        cim_simulate,
-        cim_micro_m, cim_micro_n, cim_micro_k,
-        cim_stride_index,
+        A, B, C, transpose_A, transpose_B, policy, clear_accum,
+        k_pack, wg_wait, mbar,
+        cim_simulate, cim_micro_m, cim_micro_n, cim_micro_k,
+        cim_stride_index, cim_m_inner,
     )
 
 
@@ -239,6 +225,7 @@ def gemm(
     cim_micro_n: int = 0,
     cim_micro_k: int = 0,
     cim_stride_index: bool = False,
+    cim_m_inner: bool = True,
 ) -> tir.PrimExpr:
     """TileLang GEMM operator.
 
@@ -258,6 +245,7 @@ def gemm(
         cim_micro_n (int): CIM instruction N dimension. 0 = hardware MMA default.
         cim_micro_k (int): CIM instruction K dimension. 0 = hardware MMA default.
         cim_stride_index (bool): If True, use CIM micro-based strides for A/C indexing. Defaults to False.
+        cim_m_inner (bool): If True, use M-outer/K-inner with A double buffer. Defaults to True.
 
     Returns:
         tir.Call: A handle to the GEMM operation.
@@ -265,4 +253,4 @@ def gemm(
 
     impl = gemm_v1 if _env.use_gemm_v1() else gemm_v2
     return impl(A, B, C, transpose_A, transpose_B, policy, clear_accum, k_pack, wg_wait, mbar,
-                cim_simulate, cim_micro_m, cim_micro_n, cim_micro_k, cim_stride_index)
+                cim_simulate, cim_micro_m, cim_micro_n, cim_micro_k, cim_stride_index, cim_m_inner)

@@ -30,7 +30,8 @@ def get_configs():
 )
 def flashattn_cim(batch, heads, seq_q, seq_kv, dim, is_causal,
                   block_M=128, block_N=128, num_stages=1, threads=256,
-                  micro_m=0, micro_n=0, micro_k=0, cim_stride_index=False):
+                  micro_m=0, micro_n=0, micro_k=0, cim_stride_index=False,
+                  cim_m_inner=True):
     scale = (1.0 / dim) ** 0.5 * 1.44269504
     q_shape = [batch, heads, seq_q, dim]
     kv_shape = [batch, heads, seq_kv, dim]
@@ -86,7 +87,7 @@ def flashattn_cim(batch, heads, seq_q, seq_kv, dim, is_causal,
                        policy=T.GemmWarpPolicy.FullRow,
                        cim_simulate=True,
                        cim_micro_m=micro_m, cim_micro_n=micro_n, cim_micro_k=micro_k,
-                       cim_stride_index=cim_stride_index)
+                       cim_stride_index=cim_stride_index, cim_m_inner=cim_m_inner)
 
                 T.copy(scores_max, scores_max_prev)
                 T.fill(scores_max, -T.infinity(accum_dtype))
@@ -110,7 +111,7 @@ def flashattn_cim(batch, heads, seq_q, seq_kv, dim, is_causal,
                        policy=T.GemmWarpPolicy.FullRow,
                        cim_simulate=True,
                        cim_micro_m=micro_m, cim_micro_n=micro_n, cim_micro_k=micro_k,
-                       cim_stride_index=cim_stride_index)
+                       cim_stride_index=cim_stride_index, cim_m_inner=cim_m_inner)
 
             for i, j in T.Parallel(block_M, dim):
                 acc_o[i, j] /= logsum[i]
@@ -131,6 +132,7 @@ def main(
     micro_n: int = 0,
     micro_k: int = 0,
     cim_stride_index: bool = False,
+    cim_m_inner: bool = True,
     tracekernel: bool = False,
     block_M: int = 128,
     block_N: int = 128,
@@ -145,7 +147,7 @@ def main(
     kernel = flashattn_cim(batch, heads, seq_q, seq_kv, dim, is_causal,
                            block_M=block_M, block_N=block_N, num_stages=num_stages, threads=threads,
                            micro_m=micro_m, micro_n=micro_n, micro_k=micro_k,
-                           cim_stride_index=cim_stride_index)
+                           cim_stride_index=cim_stride_index, cim_m_inner=cim_m_inner)
     report_cim_capacity(
         cim_buffers=[
             ("K_shared", (block_N, dim), "float16"),
@@ -179,6 +181,8 @@ if __name__ == "__main__":
     parser.add_argument("--micro_k", type=int, default=0, help="CIM instruction K dim (0=hardware default)")
     parser.add_argument("--cim_stride_index", action="store_true", default=False,
                         help="Use CIM micro-based strides for A/C indexing (arch-accurate, slower on GPU)")
+    parser.add_argument("--no_m_inner", action="store_true", default=False,
+                        help="Disable M-outer/K-inner with A double buffer; use K-only iteration instead")
     parser.add_argument("--tracekernel", action="store_true", help="Run kernel once for nsys/ncu tracing")
     parser.add_argument("--block_M", type=int, default=128)
     parser.add_argument("--block_N", type=int, default=128)
@@ -186,5 +190,6 @@ if __name__ == "__main__":
     parser.add_argument("--threads", type=int, default=256)
     args = parser.parse_args()
     main(args.batch, args.heads, args.seq_q, args.seq_kv, args.dim, args.is_causal,
-         args.micro_m, args.micro_n, args.micro_k, args.cim_stride_index, args.tracekernel,
+         args.micro_m, args.micro_n, args.micro_k, args.cim_stride_index,
+         not args.no_m_inner, args.tracekernel,
          args.block_M, args.block_N, args.num_stages, args.threads)
