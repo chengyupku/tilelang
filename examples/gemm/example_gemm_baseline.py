@@ -3,6 +3,9 @@ import torch
 import tilelang
 import tilelang.language as T
 import argparse
+import os, sys
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from utils.kernel_report import report_kernel_resources
 
 tilelang.disable_cache()
 
@@ -55,6 +58,7 @@ def main(M=8192, N=8192, K=4096, block_M=128, block_N=128, block_K=64,
     unit = "TFlops" if dtype == "float16" else "TOPS"
 
     kernel = matmul(M, N, K, block_M, block_N, block_K, tl_dtype, accum_dtype, num_stages, threads)
+    report_kernel_resources(kernel, threads)
     if tracekernel:
         profiler = kernel.get_profiler()
         profiler.do_bench(n_warmup=0, n_repeat=1)
