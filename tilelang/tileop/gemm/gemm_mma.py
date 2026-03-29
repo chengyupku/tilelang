@@ -162,6 +162,25 @@ class GemmMMA(GemmBase):
         # Pass cim_simulate to emitter's mma() whenever CIM is active
         mma_kwargs = {"cim_simulate": True} if cim_simulate else {}
 
+        # CIM M-inner: iterate M positions, each loads one ldmatrix_a + MMA
+        # across all N. Interleaves load/compute at fine granularity.
+        # Loop granularity reflects CIM micro_shape:
+        #   m_step = M_DIM * mma_k / micro_k  (M rows per step)
+        #   k_step = micro_k                   (K cols per step)
+        #   Total data per step = m_step * k_step = M_DIM * mma_k = 256 (1 ldmatrix)
+        cim_m_inner = cim_simulate
+        mma_k_hw = mma_emitter.micro_size_k  # hardware mma_k
+        k_hw_iters = block_K // mma_k_hw      # total hw K iterations
+        if cim_m_inner and eff_micro_k > mma_k_hw:
+            # micro_k > mma_k: trade M granularity for K granularity
+            m_per_M_DIM = eff_micro_k // mma_k_hw  # hw K sub-steps packed into M loop
+            cim_mi_iters = warp_rows * m_per_M_DIM  # finer M loop
+            cim_ki_iters = block_K // eff_micro_k   # coarser K loop
+        else:
+            m_per_M_DIM = 1
+            cim_mi_iters = warp_rows
+            cim_ki_iters = k_hw_iters
+
         if self.is_gemm_ss():
 
             @T.prim_func
@@ -171,30 +190,33 @@ class GemmMMA(GemmBase):
                 B_shared into local fragments, then issues Tensor Core mma ops,
                 accumulating into C_local.
                 """
-                A_local = T.alloc_local((a_local_size), in_dtype)
+                if cim_m_inner:
+                    # M-inner: A_local holds one hw M position (one ldmatrix worth)
+                    A_local = T.alloc_local((local_size_a), in_dtype)
+                else:
+                    A_local = T.alloc_local((a_local_size), in_dtype)
                 if not cim_simulate:
                     B_local = T.alloc_local((warp_cols * local_size_b), in_dtype)
                 if clear_accum:
                     T.clear(C_buf)
-                for ki in T.serial(0, (block_K // micro_size_k)):
-                    # Load A into fragment — K sub-passes when micro_k > mma_k
-                    for k_sub in T.serial(0, k_sub_steps):
-                        if cim_simulate:
-                            mma_emitter.ldmatrix_a(
-                                A_local, A_region,
-                                ki * k_sub_steps + k_sub,
-                                a_local_offset=k_sub * hw_load_size,
-                            )
-                        else:
-                            TensorCoreIntrinEmitter.ldmatrix_a(
-                                mma_emitter, A_local, A_region,
-                                ki * k_sub_steps + k_sub,
-                            )
 
-                    if cim_simulate:
-                        # CIM: pass B_shared directly to mma (B lives in CIM SRAM)
-                        mma_emitter.mma(A_local, B_buf, C_buf, ki, **mma_kwargs)
-                    else:
+                if cim_m_inner:
+                    # CIM M-outer/K-inner loop with micro-aware granularity.
+                    # mi/ki reflect CIM micro_shape; hw_mi/hw_ki map to hardware.
+                    for mi in T.serial(0, cim_mi_iters):
+                        for ki in T.serial(0, cim_ki_iters):
+                            # Map CIM loop vars → hardware ldmatrix/MMA positions
+                            hw_mi = mi // m_per_M_DIM
+                            k_offset = mi % m_per_M_DIM
+                            hw_ki = ki * m_per_M_DIM + k_offset
+                            mma_emitter.ldmatrix_a_mi(A_local, A_region, hw_ki, hw_mi)
+                            mma_emitter.mma_mi(A_local, B_buf, C_buf, hw_ki, hw_mi,
+                                               cim_simulate=True)
+                else:
+                    # Non-CIM baseline: standard K-inner loop
+                    for ki in T.serial(0, (block_K // micro_size_k)):
+                        TensorCoreIntrinEmitter.ldmatrix_a(
+                            mma_emitter, A_local, A_region, ki)
                         mma_emitter.ldmatrix_b(B_local, B_region, ki)
                         mma_emitter.mma(A_local, B_local, C_buf, ki)
 
