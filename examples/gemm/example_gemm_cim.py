@@ -73,9 +73,9 @@ if __name__ == "__main__":
     parser.add_argument("--dtype", type=str, default="float16", choices=["float16", "int8"])
     parser.add_argument("--num_stages", type=int, default=3)
     parser.add_argument("--threads", type=int, default=128)
-    parser.add_argument("--micro_m", type=int, default=16, help="CIM instruction M dim (0=hardware default)")
-    parser.add_argument("--micro_n", type=int, default=8, help="CIM instruction N dim (0=hardware default)")
-    parser.add_argument("--micro_k", type=int, default=16, help="CIM instruction K dim (0=hardware default)")
+    parser.add_argument("--micro_m", type=int, default=0, help="CIM instruction M dim (0=hardware default)")
+    parser.add_argument("--micro_n", type=int, default=0, help="CIM instruction N dim (0=hardware default)")
+    parser.add_argument("--micro_k", type=int, default=0, help="CIM instruction K dim (0=hardware default)")
     parser.add_argument("--cim_stride_index", action="store_true", default=False,
                         help="Use CIM micro-based strides for A/C indexing (arch-accurate, slower on GPU)")
     parser.add_argument("--tracekernel", action="store_true", help="Run kernel once for nsys/ncu tracing")

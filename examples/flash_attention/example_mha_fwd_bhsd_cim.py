@@ -175,7 +175,7 @@ if __name__ == "__main__":
     parser.add_argument("--dim", type=int, default=128, help="head dimension")
     parser.add_argument("--is_causal", action="store_true", help="causal attention")
     parser.add_argument("--micro_m", type=int, default=0, help="CIM instruction M dim (0=hardware default)")
-    parser.add_argument("--micro_n", type=int, default=30, help="CIM instruction N dim (0=hardware default)")
+    parser.add_argument("--micro_n", type=int, default=0, help="CIM instruction N dim (0=hardware default)")
     parser.add_argument("--micro_k", type=int, default=0, help="CIM instruction K dim (0=hardware default)")
     parser.add_argument("--cim_stride_index", action="store_true", default=False,
                         help="Use CIM micro-based strides for A/C indexing (arch-accurate, slower on GPU)")
