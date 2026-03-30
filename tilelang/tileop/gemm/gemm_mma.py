@@ -160,6 +160,10 @@ class GemmMMA(GemmBase):
         cim_simulate = self.cim_simulate
         # Pass cim_simulate to emitter's mma() whenever CIM is active
         mma_kwargs = {"cim_simulate": True} if cim_simulate else {}
+        # CIM_SKIP_B_ADDR: skip B address computation, fill B_local with
+        # constant instead. Uses baseline mma template (no cim_simulate).
+        import os
+        _skip_b_addr = cim_simulate and os.environ.get("CIM_SKIP_B_ADDR", "0") == "1"
 
         # CIM M-inner: iterate M positions, each loads one ldmatrix_a + MMA
         # across all N. Interleaves load/compute at fine granularity.
@@ -196,7 +200,7 @@ class GemmMMA(GemmBase):
                     A_local = T.alloc_local((2 * local_size_a), in_dtype)
                 else:
                     A_local = T.alloc_local((a_local_size), in_dtype)
-                if not cim_simulate:
+                if not cim_simulate or _skip_b_addr:
                     B_local = T.alloc_local((warp_cols * local_size_b), in_dtype)
                 if clear_accum:
                     T.clear(C_buf)
@@ -243,21 +247,25 @@ class GemmMMA(GemmBase):
                         A_local, B_buf, C_buf, hw_ki_l, hw_mi_l,
                         cim_simulate=True, a_buf_offset=last_buf)
                 else:
-                    # K-inner loop: baseline (A+B load) or CIM K-only fallback
+                    # K-inner loop
+                    if _skip_b_addr:
+                        T.fill(B_local, T.float16(8.53))
                     for ki in T.serial(0, (block_K // micro_size_k)):
-                        for k_sub in T.serial(0, k_sub_steps):
-                            if cim_simulate:
+                        if _skip_b_addr:
+                            TensorCoreIntrinEmitter.ldmatrix_a(
+                                mma_emitter, A_local, A_region, ki)
+                            TensorCoreIntrinEmitter.mma(
+                                mma_emitter, A_local, B_local, C_buf, ki)
+                        elif cim_simulate:
+                            for k_sub in T.serial(0, k_sub_steps):
                                 mma_emitter.ldmatrix_a(
                                     A_local, A_region,
                                     ki * k_sub_steps + k_sub,
                                     a_local_offset=k_sub * hw_load_size)
-                            else:
-                                TensorCoreIntrinEmitter.ldmatrix_a(
-                                    mma_emitter, A_local, A_region,
-                                    ki * k_sub_steps + k_sub)
-                        if cim_simulate:
                             mma_emitter.mma(A_local, B_buf, C_buf, ki, **mma_kwargs)
                         else:
+                            TensorCoreIntrinEmitter.ldmatrix_a(
+                                mma_emitter, A_local, A_region, ki)
                             mma_emitter.ldmatrix_b(B_local, B_region, ki)
                             mma_emitter.mma(A_local, B_local, C_buf, ki)
 
@@ -304,13 +312,17 @@ class GemmMMA(GemmBase):
                 B_shared into local fragments, then issues Tensor Core mma ops,
                 accumulating into C_local.
                 """
-                if not cim_simulate:
+                if not cim_simulate or _skip_b_addr:
                     B_local = T.alloc_local((warp_cols * local_size_b), in_dtype)
                 if clear_accum:
                     T.clear(C_buf)
+                if _skip_b_addr:
+                    T.fill(B_local, T.float16(8.53))
                 for ki in T.serial(0, (block_K // micro_size_k)):
-                    if cim_simulate:
-                        # CIM: pass B_shared directly (B lives in CIM SRAM)
+                    if _skip_b_addr:
+                        TensorCoreIntrinEmitter.mma(
+                            mma_emitter, A_buf, B_local, C_buf, ki)
+                    elif cim_simulate:
                         mma_emitter.mma(A_buf, B_buf, C_buf, ki, **mma_kwargs)
                     else:
                         mma_emitter.ldmatrix_b(B_local, B_region, ki)
