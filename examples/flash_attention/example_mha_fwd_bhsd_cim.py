@@ -164,7 +164,10 @@ def main(
     )
 
     if tracekernel:
-        kernel.get_profiler().do_bench(n_warmup=0, n_repeat=1)
+        profiler = kernel.get_profiler()
+        ins = profiler._get_inputs()
+        profiler.func(*ins)
+        torch.cuda.synchronize()
         return
 
     profiler = kernel.get_profiler()

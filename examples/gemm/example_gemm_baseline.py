@@ -61,7 +61,9 @@ def main(M=8192, N=8192, K=4096, block_M=128, block_N=128, block_K=64,
     report_kernel_resources(kernel, threads)
     if tracekernel:
         profiler = kernel.get_profiler()
-        profiler.do_bench(n_warmup=0, n_repeat=1)
+        ins = profiler._get_inputs()
+        profiler.func(*ins)
+        torch.cuda.synchronize()
         return
     profiler = kernel.get_profiler()
     latency = profiler.do_bench(n_warmup=50, n_repeat=200)

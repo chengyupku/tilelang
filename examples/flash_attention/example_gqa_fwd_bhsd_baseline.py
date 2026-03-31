@@ -168,7 +168,10 @@ def main(
                            block_M=block_M, block_N=block_N, num_stages=num_stages, threads=threads)
         report_kernel_resources(kernel, threads)
         if tracekernel:
-            kernel.get_profiler().do_bench(n_warmup=0, n_repeat=1)
+            profiler = kernel.get_profiler()
+            ins = profiler._get_inputs()
+            profiler.func(*ins)
+            torch.cuda.synchronize()
             return
         profiler = kernel.get_profiler()
         if not no_ref:
