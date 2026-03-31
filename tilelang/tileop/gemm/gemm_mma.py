@@ -187,56 +187,41 @@ class GemmMMA(GemmBase):
             cim_ki_iters = k_hw_iters
 
         if self.is_gemm_ss():
-
-            @T.prim_func
-            def _gemm_ssr() -> None:
-                """
-                The inner macro that loads data from shared buffers A_shared and
-                B_shared into local fragments, then issues Tensor Core mma ops,
-                accumulating into C_local.
-                """
-                if cim_m_inner:
+            # NOTE: TVMScript's @T.prim_func parses BOTH branches of
+            # Python if/else inside the function body, even when the
+            # condition is a compile-time constant. To avoid generating
+            # TIR for the unused branch, we split cim_m_inner into
+            # separate @T.prim_func definitions at the Python level.
+            if cim_m_inner:
+                @T.prim_func
+                def _gemm_ssr() -> None:
                     # CIM M-inner: A_local double-buffered (2 × one ldmatrix worth)
                     A_local = T.alloc_local((2 * local_size_a), in_dtype)
-                else:
-                    A_local = T.alloc_local((a_local_size), in_dtype)
-                if not cim_simulate or _skip_b_addr:
-                    B_local = T.alloc_local((warp_cols * local_size_b), in_dtype)
-                if clear_accum:
-                    T.clear(C_buf)
-
-                if cim_m_inner:
+                    if clear_accum:
+                        T.clear(C_buf)
                     # CIM M-outer/K-inner with double-buffered A_local.
-                    # Prefetch next A while computing current, hiding ldmatrix latency.
                     total_steps = cim_mi_iters * cim_ki_iters
-
                     # Prologue: load first step into buffer 0
                     mma_emitter.ldmatrix_a_mi(A_local, A_region, 0, 0,
                                               a_buf_offset=0)
-
                     for step in T.serial(0, total_steps - 1):
                         cur_buf = (step % 2) * local_size_a
                         nxt_buf = ((step + 1) % 2) * local_size_a
-                        # Current step hw positions
                         mi_c = step // cim_ki_iters
                         ki_c = step % cim_ki_iters
                         hw_mi_c = mi_c // m_per_M_DIM
                         hw_ki_c = ki_c * m_per_M_DIM + mi_c % m_per_M_DIM
-                        # Next step hw positions
                         mi_n = (step + 1) // cim_ki_iters
                         ki_n = (step + 1) % cim_ki_iters
                         hw_mi_n = mi_n // m_per_M_DIM
                         hw_ki_n = ki_n * m_per_M_DIM + mi_n % m_per_M_DIM
-                        # Prefetch next A into other buffer
                         mma_emitter.ldmatrix_a_mi(
                             A_local, A_region, hw_ki_n, hw_mi_n,
                             a_buf_offset=nxt_buf)
-                        # Compute current from current buffer
                         mma_emitter.mma_mi(
                             A_local, B_buf, C_buf, hw_ki_c, hw_mi_c,
                             cim_simulate=True, a_buf_offset=cur_buf)
-
-                    # Epilogue: compute last step (Python-level constants)
+                    # Epilogue
                     last = total_steps - 1
                     last_buf = (last % 2) * local_size_a
                     mi_l = last // cim_ki_iters
@@ -246,7 +231,14 @@ class GemmMMA(GemmBase):
                     mma_emitter.mma_mi(
                         A_local, B_buf, C_buf, hw_ki_l, hw_mi_l,
                         cim_simulate=True, a_buf_offset=last_buf)
-                else:
+            else:
+                @T.prim_func
+                def _gemm_ssr() -> None:
+                    A_local = T.alloc_local((a_local_size), in_dtype)
+                    if not cim_simulate or _skip_b_addr:
+                        B_local = T.alloc_local((warp_cols * local_size_b), in_dtype)
+                    if clear_accum:
+                        T.clear(C_buf)
                     # K-inner loop
                     if _skip_b_addr:
                         T.fill(B_local, T.float16(8.53))
