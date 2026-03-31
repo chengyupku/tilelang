@@ -139,13 +139,17 @@ def main(
     micro_n: int = 0,
     micro_k: int = 0,
     cim_stride_index: bool = False,
-    cim_m_inner: bool = True,
+    strategy: str = "m-inner",
     tracekernel: bool = False,
     block_M: int = 128,
     block_N: int = 128,
     num_stages: int = 2,
     threads: int = 256,
 ):
+    cim_m_inner = (strategy == "m-inner")
+    if strategy == "skip-b-addr":
+        os.environ["CIM_SKIP_B_ADDR"] = "1"
+
     flops_per_matmul = 2.0 * batch * heads * seq_q * seq_kv * dim
     total_flops = 2 * flops_per_matmul
     if is_causal:
@@ -155,6 +159,7 @@ def main(
                            block_M=block_M, block_N=block_N, num_stages=num_stages, threads=threads,
                            micro_m=micro_m, micro_n=micro_n, micro_k=micro_k,
                            cim_stride_index=cim_stride_index, cim_m_inner=cim_m_inner)
+    os.environ.pop("CIM_SKIP_B_ADDR", None)
     report_cim_capacity(
         cim_buffers=[
             ("K_shared", (block_N, dim), "float16"),
@@ -172,7 +177,7 @@ def main(
     profiler = kernel.get_profiler()
     latency = profiler.do_bench(backend="cupti", n_warmup=50, n_repeat=200)
     micro_str = f"micro={micro_m}/{micro_n}/{micro_k}" if any([micro_m, micro_n, micro_k]) else "micro=default"
-    print(f"CIM GQA BHSD ({micro_str}, groups={groups}): {latency:.2f} ms, {total_flops / latency * 1e-9:.2f} TFlops")
+    print(f"CIM GQA BHSD ({micro_str}, {strategy}, groups={groups}): {latency:.2f} ms, {total_flops / latency * 1e-9:.2f} TFlops")
 
 
 if __name__ == "__main__":
@@ -189,8 +194,9 @@ if __name__ == "__main__":
     parser.add_argument("--micro_k", type=int, default=0, help="CIM instruction K dim (0=hardware default)")
     parser.add_argument("--cim_stride_index", action="store_true", default=False,
                         help="Use CIM micro-based strides for A/C indexing (arch-accurate, slower on GPU)")
-    parser.add_argument("--no_m_inner", action="store_true", default=False,
-                        help="Disable M-outer/K-inner with A double buffer; use K-only iteration instead")
+    parser.add_argument("--strategy", type=str, default="m-inner",
+                        choices=["k-only", "m-inner", "skip-b-addr"],
+                        help="CIM iteration strategy")
     parser.add_argument("--tracekernel", action="store_true", help="Run kernel once for nsys/ncu tracing")
     parser.add_argument("--block_M", type=int, default=128)
     parser.add_argument("--block_N", type=int, default=128)
@@ -199,5 +205,5 @@ if __name__ == "__main__":
     args = parser.parse_args()
     main(args.batch, args.heads, args.seq_q, args.seq_kv, args.dim, args.is_causal, args.groups,
          args.micro_m, args.micro_n, args.micro_k, args.cim_stride_index,
-         not args.no_m_inner, args.tracekernel,
+         args.strategy, args.tracekernel,
          args.block_M, args.block_N, args.num_stages, args.threads)
