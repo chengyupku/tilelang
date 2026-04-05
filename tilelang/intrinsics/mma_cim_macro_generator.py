@@ -451,8 +451,13 @@ class CIMTensorCoreIntrinEmitter(_BaseTensorCoreIntrinEmitter):
 
     def mma_mi(self, A_local_buf: Buffer, B_local_buf: Buffer, C_local_buf: Buffer,
                ki: PrimExpr, mi: PrimExpr, cim_simulate: bool = False,
-               offset: PrimExpr | None = 0, a_buf_offset: PrimExpr | int = 0):
-        """MMA for a single hw M position (mi) across all hw N positions."""
+               offset: PrimExpr | None = 0, a_buf_offset: PrimExpr | int = 0,
+               n_cols: int | None = None):
+        """MMA for a single hw M position (mi) across N positions.
+
+        n_cols: number of N positions to compute (default: all hw_warp_cols).
+                Set to fake_warp_cols for CIM micro-aware iteration count.
+        """
         hw_warp_cols = self.warp_cols
         local_size_a_hw = self.local_size_a
         local_size_b = self.local_size_b
@@ -467,9 +472,11 @@ class CIMTensorCoreIntrinEmitter(_BaseTensorCoreIntrinEmitter):
         b_is_fragment = is_fragment(B_local_buf)
         b_local_stride: PrimExpr = ki * hw_warp_cols * local_size_b if b_is_fragment else 0
 
+        _n_cols = n_cols if n_cols is not None else hw_warp_cols
+
         @T.macro
         def _mma_mi(A_local_buf, B_local_buf, C_local_buf, a_buf_offset=0):
-            for j in T.serial(hw_warp_cols):
+            for j in T.serial(_n_cols):
                 a_off = a_buf_offset
                 c_off = mi * hw_warp_cols * local_size_out_hw + j * local_size_out_hw
                 b_off = b_local_stride + j * local_size_b

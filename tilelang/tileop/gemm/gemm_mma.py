@@ -199,38 +199,38 @@ class GemmMMA(GemmBase):
                     A_local = T.alloc_local((2 * local_size_a), in_dtype)
                     if clear_accum:
                         T.clear(C_buf)
-                    # CIM M-outer/K-inner with double-buffered A_local.
-                    total_steps = cim_mi_iters * cim_ki_iters
-                    # Prologue: load first step into buffer 0
-                    mma_emitter.ldmatrix_a_mi(A_local, A_region, 0, 0,
-                                              a_buf_offset=0)
-                    for step in T.serial(0, total_steps - 1):
-                        cur_buf = (step % 2) * local_size_a
-                        nxt_buf = ((step + 1) % 2) * local_size_a
-                        mi_c = step // cim_ki_iters
-                        ki_c = step % cim_ki_iters
-                        hw_mi_c = mi_c // m_per_M_DIM
-                        hw_ki_c = ki_c * m_per_M_DIM + mi_c % m_per_M_DIM
-                        mi_n = (step + 1) // cim_ki_iters
-                        ki_n = (step + 1) % cim_ki_iters
-                        hw_mi_n = mi_n // m_per_M_DIM
-                        hw_ki_n = ki_n * m_per_M_DIM + mi_n % m_per_M_DIM
+                    # Nested M-outer / K-inner with A double buffer.
+                    # Uses direct mi/ki loop variables — no div/mod overhead.
+                    # Double buffer alternates within each mi's K sweep.
+                    for mi in T.serial(0, cim_mi_iters):
+                        hw_mi = mi // m_per_M_DIM
+                        ki_base = mi % m_per_M_DIM  # K offset within M_DIM
+                        # Prologue: load first ki for this mi
+                        hw_ki_0 = ki_base
                         mma_emitter.ldmatrix_a_mi(
-                            A_local, A_region, hw_ki_n, hw_mi_n,
-                            a_buf_offset=nxt_buf)
+                            A_local, A_region, hw_ki_0, hw_mi,
+                            a_buf_offset=0)
+                        for ki in T.serial(0, cim_ki_iters - 1):
+                            cur_buf = (ki % 2) * local_size_a
+                            nxt_buf = ((ki + 1) % 2) * local_size_a
+                            hw_ki_c = ki * m_per_M_DIM + ki_base
+                            hw_ki_n = (ki + 1) * m_per_M_DIM + ki_base
+                            # Prefetch next ki into other buffer
+                            mma_emitter.ldmatrix_a_mi(
+                                A_local, A_region, hw_ki_n, hw_mi,
+                                a_buf_offset=nxt_buf)
+                            # Compute current
+                            mma_emitter.mma_mi(
+                                A_local, B_buf, C_buf, hw_ki_c, hw_mi,
+                                cim_simulate=True, a_buf_offset=cur_buf,
+                                )
+                        # Epilogue: compute last ki
+                        last_ki = cim_ki_iters - 1
+                        last_buf = (last_ki % 2) * local_size_a
+                        hw_ki_l = last_ki * m_per_M_DIM + ki_base
                         mma_emitter.mma_mi(
-                            A_local, B_buf, C_buf, hw_ki_c, hw_mi_c,
-                            cim_simulate=True, a_buf_offset=cur_buf)
-                    # Epilogue
-                    last = total_steps - 1
-                    last_buf = (last % 2) * local_size_a
-                    mi_l = last // cim_ki_iters
-                    ki_l = last % cim_ki_iters
-                    hw_mi_l = mi_l // m_per_M_DIM
-                    hw_ki_l = ki_l * m_per_M_DIM + mi_l % m_per_M_DIM
-                    mma_emitter.mma_mi(
-                        A_local, B_buf, C_buf, hw_ki_l, hw_mi_l,
-                        cim_simulate=True, a_buf_offset=last_buf)
+                            A_local, B_buf, C_buf, hw_ki_l, hw_mi,
+                            cim_simulate=True, a_buf_offset=last_buf)
             else:
                 @T.prim_func
                 def _gemm_ssr() -> None:
