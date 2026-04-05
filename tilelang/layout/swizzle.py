@@ -123,8 +123,12 @@ def make_full_bank_swizzled_layout(*args):
         make_full_bank_swizzled_layout(stride, continuous, element_size)
     """
     if len(args) == 1:
-        stride, continuous = _get_stride_continuous(args[0])
-        element_size = _get_element_size(args[0])
+        try:
+            buffer, _, _ = _get_buffer_info(args[0])
+            return _ffi_api.make_full_bank_swizzled_layout(buffer)
+        except TypeError:
+            stride, continuous = _get_stride_continuous(args[0])
+            element_size = _get_element_size(args[0])
     elif len(args) == 3:
         stride, continuous, element_size = args
     else:
@@ -147,8 +151,12 @@ def make_half_bank_swizzled_layout(*args):
         make_half_bank_swizzled_layout(stride, continuous, element_size)
     """
     if len(args) == 1:
-        stride, continuous = _get_stride_continuous(args[0])
-        element_size = _get_element_size(args[0])
+        try:
+            buffer, _, _ = _get_buffer_info(args[0])
+            return _ffi_api.make_half_bank_swizzled_layout(buffer)
+        except TypeError:
+            stride, continuous = _get_stride_continuous(args[0])
+            element_size = _get_element_size(args[0])
     elif len(args) == 3:
         stride, continuous, element_size = args
     else:
@@ -171,8 +179,12 @@ def make_quarter_bank_swizzled_layout(*args):
         make_quarter_bank_swizzled_layout(stride, continuous, element_size)
     """
     if len(args) == 1:
-        stride, continuous = _get_stride_continuous(args[0])
-        element_size = _get_element_size(args[0])
+        try:
+            buffer, _, _ = _get_buffer_info(args[0])
+            return _ffi_api.make_quarter_bank_swizzled_layout(buffer)
+        except TypeError:
+            stride, continuous = _get_stride_continuous(args[0])
+            element_size = _get_element_size(args[0])
     elif len(args) == 3:
         stride, continuous, element_size = args
     else:

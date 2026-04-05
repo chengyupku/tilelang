@@ -1,5 +1,6 @@
 from __future__ import annotations
 from typing import Any
+import inspect
 import tvm
 from tvm.ir import PrimExpr
 from tvm.ir.base import Span
@@ -9,6 +10,11 @@ import tvm.tir.op as _tvm_op
 
 from tilelang.language.dtypes import AnyDType
 from tilelang.utils.deprecated import deprecated_warning
+
+
+_CALL_INTRIN_SUPPORTS_ANNOTATIONS = (
+    "annotations" in inspect.signature(_tvm_op.call_intrin).parameters
+)
 
 
 def call_packed(*args, span=None):
@@ -145,7 +151,9 @@ def call_intrin(dtype, func_name, *args, annotations=None, span=None):
     call : PrimExpr
         The call expression.
     """
-    return _tvm_op.call_intrin(dtype, func_name, *args, annotations=annotations, span=span)
+    if _CALL_INTRIN_SUPPORTS_ANNOTATIONS:
+        return _tvm_op.call_intrin(dtype, func_name, *args, annotations=annotations, span=span)
+    return _tvm_op.call_intrin(dtype, func_name, *args, span=span)
 
 
 def call_pure_extern(dtype, func_name, *args, span=None):
