@@ -129,18 +129,36 @@ class GemmMMA(GemmBase):
         local_size_a = mma_emitter.local_size_a
         local_size_b = mma_emitter.local_size_b
         block_K = mma_emitter.chunk
-        micro_size_k = micro_size_k_for_loop if micro_size_k_for_loop else mma_emitter.micro_size_k
-        # For CIM with custom micro_k: A_local sized by warp_m × micro_k / 32
-        # and K sub-passes needed to fill it
-        if has_cim_micro:
-            WARP_SIZE = 32
-            a_local_size = warp_row_tiles * eff_micro_k // WARP_SIZE
-            k_sub_steps = eff_micro_k // mma_k  # number of mma_k slices per micro_k
-            hw_load_size = warp_rows * local_size_a  # elements per ldmatrix pass
-        else:
-            a_local_size = warp_rows * local_size_a
+
+        # CIM_SKIP_B_ADDR: skip B address computation, fill B_local with
+        # constant instead. Uses BASELINE mma template (no cim_simulate),
+        # so the compute is real hardware mma — must iterate at hardware
+        # mma_k granularity, not custom cim_micro_k. Detect early so we
+        # can override loop sizing below.
+        import os
+        _skip_b_addr = cim_simulate and os.environ.get("CIM_SKIP_B_ADDR", "0") == "1"
+
+        # For skip-b-addr, ignore custom cim_micro_k for loop structure:
+        # the baseline mma it dispatches to does one hardware-mma_k slice
+        # per call, so the ki loop must run block_K / mma_k_hw times.
+        if _skip_b_addr:
+            micro_size_k = mma_emitter.micro_size_k  # hw mma_k (e.g. 32 for int8)
+            a_local_size = warp_rows * local_size_a  # baseline-sized A_local
             k_sub_steps = 1
             hw_load_size = warp_rows * local_size_a
+        else:
+            micro_size_k = micro_size_k_for_loop if micro_size_k_for_loop else mma_emitter.micro_size_k
+            # For CIM with custom micro_k: A_local sized by warp_m × micro_k / 32
+            # and K sub-passes needed to fill it
+            if has_cim_micro:
+                WARP_SIZE = 32
+                a_local_size = warp_row_tiles * eff_micro_k // WARP_SIZE
+                k_sub_steps = eff_micro_k // mma_k  # number of mma_k slices per micro_k
+                hw_load_size = warp_rows * local_size_a  # elements per ldmatrix pass
+            else:
+                a_local_size = warp_rows * local_size_a
+                k_sub_steps = 1
+                hw_load_size = warp_rows * local_size_a
         # We use region for memory input to support strided gemm
         # T.gemm(A_shared[0:128, :], B_shared, C_local)
         A_region = self.ARegion
@@ -160,10 +178,6 @@ class GemmMMA(GemmBase):
         cim_simulate = self.cim_simulate
         # Pass cim_simulate to emitter's mma() whenever CIM is active
         mma_kwargs = {"cim_simulate": True} if cim_simulate else {}
-        # CIM_SKIP_B_ADDR: skip B address computation, fill B_local with
-        # constant instead. Uses baseline mma template (no cim_simulate).
-        import os
-        _skip_b_addr = cim_simulate and os.environ.get("CIM_SKIP_B_ADDR", "0") == "1"
 
         # CIM M-inner: iterate M positions, each loads one ldmatrix_a + MMA
         # across all N. Interleaves load/compute at fine granularity.
